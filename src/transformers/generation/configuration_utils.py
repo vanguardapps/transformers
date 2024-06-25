@@ -15,10 +15,17 @@
 """Generation configuration class and utilities."""
 
 import copy
+import faiss
 import json
+import numpy as np
 import os
+import regex as re
+import sqlite3
 import warnings
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, is_dataclass
+from itertools import islice
+from tqdm import tqdm
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from .. import __version__
@@ -41,7 +48,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-METADATA_FIELDS = ("_from_model_config", "_commit_hash", "_original_object_hash", "transformers_version")
+METADATA_FIELDS = (
+    "_from_model_config",
+    "_commit_hash",
+    "_original_object_hash",
+    "transformers_version",
+)
 NEEDS_CACHE_CONFIG = {}
 
 if is_torch_available():
@@ -249,6 +261,18 @@ class GenerationConfig(PushToHubMixin):
                         The downside of this scheme is that it considers all possible next tokens and can be slower than "lefthash".
             - context_width(`int`):
                 The context length of previous tokens to use in seeding. Higher context length makes watermarking more robust.
+        knn_store (`KNNStore`, *optional*):
+            KNN datastore that, if supplied, is used to perform KNN-MT-style interpolation on the logits during decoding.
+        knn_k (`int`, *optional): The number of top k target tokens to retrieve from the KNN datastore for interpolation
+            with the preexisting base model logits. Note: if k is higher than the number of available tokens, all
+            available tokens will be used. Defaults to 20.
+        knn_temperature (`float`, *optional*): The temperature to be used when interpolating the top k results from the
+            KNN datastore with the results from the base model. See [this paper](https://arxiv.org/abs/2010.00710) for
+            details on the exact math used during interpolation. Defaults to 1.
+        knn_interpolation_coefficient (`float`, *optional*):
+            Determines the proportion of interpolation between the base model logits and the KNN-computed logits. See
+            [this paper](https://arxiv.org/abs/2010.00710) for details on the exact math used during interpolation.
+            Only has an effect if provided alongside `knn_store`. Defaults to 0.5.
 
         > Parameters that define the output variables of generate
 
@@ -360,7 +384,9 @@ class GenerationConfig(PushToHubMixin):
         self.forced_bos_token_id = kwargs.pop("forced_bos_token_id", None)
         self.forced_eos_token_id = kwargs.pop("forced_eos_token_id", None)
         self.remove_invalid_values = kwargs.pop("remove_invalid_values", False)
-        self.exponential_decay_length_penalty = kwargs.pop("exponential_decay_length_penalty", None)
+        self.exponential_decay_length_penalty = kwargs.pop(
+            "exponential_decay_length_penalty", None
+        )
         self.suppress_tokens = kwargs.pop("suppress_tokens", None)
         self.begin_suppress_tokens = kwargs.pop("begin_suppress_tokens", None)
         self.forced_decoder_ids = kwargs.pop("forced_decoder_ids", None)
@@ -375,6 +401,16 @@ class GenerationConfig(PushToHubMixin):
             self.watermarking_config = watermarking_config
         else:
             self.watermarking_config = WatermarkingConfig.from_dict(watermarking_config)
+        knn_store = kwargs.pop("knn_store", None)
+        if isinstance(knn_store, KNNStore):
+            self.knn_store = knn_store
+        else:
+            self.knn_store = None
+        self.knn_k = kwargs.pop("knn_k", 20)
+        self.knn_temperature = kwargs.pop("knn_temperature", 1)
+        self.knn_interpolation_coefficient = kwargs.pop(
+            "knn_interpolation_coefficient", 0.5
+        )
 
         # Parameters that define the output variables of `generate`
         self.num_return_sequences = kwargs.pop("num_return_sequences", 1)
@@ -390,12 +426,16 @@ class GenerationConfig(PushToHubMixin):
         self.eos_token_id = kwargs.pop("eos_token_id", None)
 
         # Generation parameters exclusive to encoder-decoder models
-        self.encoder_no_repeat_ngram_size = kwargs.pop("encoder_no_repeat_ngram_size", 0)
+        self.encoder_no_repeat_ngram_size = kwargs.pop(
+            "encoder_no_repeat_ngram_size", 0
+        )
         self.decoder_start_token_id = kwargs.pop("decoder_start_token_id", None)
 
         # Assistant generation
         self.num_assistant_tokens = kwargs.pop("num_assistant_tokens", 5)
-        self.num_assistant_tokens_schedule = kwargs.pop("num_assistant_tokens_schedule", "heuristic")
+        self.num_assistant_tokens_schedule = kwargs.pop(
+            "num_assistant_tokens_schedule", "heuristic"
+        )
 
         # Cache implementation
         self.cache_implementation = kwargs.pop("cache_implementation", None)
@@ -442,14 +482,20 @@ class GenerationConfig(PushToHubMixin):
         if not isinstance(other, GenerationConfig):
             return False
 
-        self_without_metadata = self.to_json_string(use_diff=False, ignore_metadata=True)
-        other_without_metadata = other.to_json_string(use_diff=False, ignore_metadata=True)
+        self_without_metadata = self.to_json_string(
+            use_diff=False, ignore_metadata=True
+        )
+        other_without_metadata = other.to_json_string(
+            use_diff=False, ignore_metadata=True
+        )
         return self_without_metadata == other_without_metadata
 
     def __repr__(self):
         return f"{self.__class__.__name__} {self.to_json_string(ignore_metadata=True)}"
 
-    def get_generation_mode(self, assistant_model: Optional["PreTrainedModel"] = None) -> GenerationMode:
+    def get_generation_mode(
+        self, assistant_model: Optional["PreTrainedModel"] = None
+    ) -> GenerationMode:
         """
         Returns the generation mode triggered by the [`GenerationConfig`] instance.
 
@@ -512,9 +558,13 @@ class GenerationConfig(PushToHubMixin):
 
         # Validation of individual attributes
         if self.early_stopping not in {True, False, "never"}:
-            raise ValueError(f"`early_stopping` must be a boolean or 'never', but is {self.early_stopping}.")
+            raise ValueError(
+                f"`early_stopping` must be a boolean or 'never', but is {self.early_stopping}."
+            )
         if self.max_new_tokens is not None and self.max_new_tokens <= 0:
-            raise ValueError(f"`max_new_tokens` must be greater than 0, but is {self.max_new_tokens}.")
+            raise ValueError(
+                f"`max_new_tokens` must be greater than 0, but is {self.max_new_tokens}."
+            )
         if self.pad_token_id is not None and self.pad_token_id < 0:
             warnings.warn(
                 f"`pad_token_id` should be positive but got {self.pad_token_id}. This will cause errors when batch generating, if there is padding. "
@@ -538,39 +588,55 @@ class GenerationConfig(PushToHubMixin):
             )
             if self.temperature is not None and self.temperature != 1.0:
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="temperature", flag_value=self.temperature),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="temperature", flag_value=self.temperature
+                    ),
                     UserWarning,
                 )
             if self.top_p is not None and self.top_p != 1.0:
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="top_p", flag_value=self.top_p),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="top_p", flag_value=self.top_p
+                    ),
                     UserWarning,
                 )
             if self.min_p is not None:
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="min_p", flag_value=self.min_p),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="min_p", flag_value=self.min_p
+                    ),
                     UserWarning,
                 )
             if self.typical_p is not None and self.typical_p != 1.0:
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="typical_p", flag_value=self.typical_p),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="typical_p", flag_value=self.typical_p
+                    ),
                     UserWarning,
                 )
             if (
-                self.top_k is not None and self.top_k != 50 and self.penalty_alpha is None
+                self.top_k is not None
+                and self.top_k != 50
+                and self.penalty_alpha is None
             ):  # contrastive search uses top_k
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="top_k", flag_value=self.top_k),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="top_k", flag_value=self.top_k
+                    ),
                     UserWarning,
                 )
             if self.epsilon_cutoff is not None and self.epsilon_cutoff != 0.0:
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="epsilon_cutoff", flag_value=self.epsilon_cutoff),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="epsilon_cutoff", flag_value=self.epsilon_cutoff
+                    ),
                     UserWarning,
                 )
             if self.eta_cutoff is not None and self.eta_cutoff != 0.0:
                 warnings.warn(
-                    greedy_wrong_parameter_msg.format(flag_name="eta_cutoff", flag_value=self.eta_cutoff),
+                    greedy_wrong_parameter_msg.format(
+                        flag_name="eta_cutoff", flag_value=self.eta_cutoff
+                    ),
                     UserWarning,
                 )
 
@@ -582,11 +648,14 @@ class GenerationConfig(PushToHubMixin):
         if self.num_beams == 1:
             single_beam_wrong_parameter_msg = (
                 "`num_beams` is set to 1. However, `{flag_name}` is set to `{flag_value}` -- this flag is only used "
-                "in beam-based generation modes. You should set `num_beams>1` or unset `{flag_name}`." + fix_location
+                "in beam-based generation modes. You should set `num_beams>1` or unset `{flag_name}`."
+                + fix_location
             )
             if self.early_stopping is not False:
                 warnings.warn(
-                    single_beam_wrong_parameter_msg.format(flag_name="early_stopping", flag_value=self.early_stopping),
+                    single_beam_wrong_parameter_msg.format(
+                        flag_name="early_stopping", flag_value=self.early_stopping
+                    ),
                     UserWarning,
                 )
             if self.num_beam_groups is not None and self.num_beam_groups != 1:
@@ -605,12 +674,16 @@ class GenerationConfig(PushToHubMixin):
                 )
             if self.length_penalty is not None and self.length_penalty != 1.0:
                 warnings.warn(
-                    single_beam_wrong_parameter_msg.format(flag_name="length_penalty", flag_value=self.length_penalty),
+                    single_beam_wrong_parameter_msg.format(
+                        flag_name="length_penalty", flag_value=self.length_penalty
+                    ),
                     UserWarning,
                 )
             if self.constraints is not None:
                 warnings.warn(
-                    single_beam_wrong_parameter_msg.format(flag_name="constraints", flag_value=self.constraints),
+                    single_beam_wrong_parameter_msg.format(
+                        flag_name="constraints", flag_value=self.constraints
+                    ),
                     UserWarning,
                 )
 
@@ -621,11 +694,14 @@ class GenerationConfig(PushToHubMixin):
                 constrained_wrong_parameter_msg = (
                     "one of `constraints`, `force_words_ids` is not `None`, triggering constrained beam search. However, "
                     "`{flag_name}` is set to `{flag_value}`, which is incompatible with this generation mode. Set "
-                    "`constraints` and `force_words_ids` to `None` or unset `{flag_name}` to continue." + fix_location
+                    "`constraints` and `force_words_ids` to `None` or unset `{flag_name}` to continue."
+                    + fix_location
                 )
                 if self.do_sample is True:
                     raise ValueError(
-                        constrained_wrong_parameter_msg.format(flag_name="do_sample", flag_value=self.do_sample)
+                        constrained_wrong_parameter_msg.format(
+                            flag_name="do_sample", flag_value=self.do_sample
+                        )
                     )
                 if self.num_beam_groups is not None and self.num_beam_groups != 1:
                     raise ValueError(
@@ -640,9 +716,14 @@ class GenerationConfig(PushToHubMixin):
                     "this generation mode, "
                 )
                 if self.do_sample is True:
-                    raise ValueError(group_error_prefix + "`do_sample` must be set to `False`")
+                    raise ValueError(
+                        group_error_prefix + "`do_sample` must be set to `False`"
+                    )
                 if self.num_beams % self.num_beam_groups != 0:
-                    raise ValueError(group_error_prefix + "`num_beams` should be divisible by `num_beam_groups`")
+                    raise ValueError(
+                        group_error_prefix
+                        + "`num_beams` should be divisible by `num_beam_groups`"
+                    )
                 if self.diversity_penalty == 0.0:
                     raise ValueError(
                         group_error_prefix
@@ -679,10 +760,16 @@ class GenerationConfig(PushToHubMixin):
         # 6.  check watermarking arguments
         if self.watermarking_config is not None:
             if not isinstance(self.watermarking_config, WatermarkingConfig):
-                self.watermarking_config = WatermarkingConfig.from_dict(self.watermarking_config)
+                self.watermarking_config = WatermarkingConfig.from_dict(
+                    self.watermarking_config
+                )
             self.watermarking_config.validate()
 
-        # 7. check common issue: passing `generate` arguments inside the generation config
+        # 7. check KNN datastore arguments
+        if self.knn_store is not None:
+            self.knn_store.validate()
+
+        # 8. check common issue: passing `generate` arguments inside the generation config
         generate_arguments = (
             "logits_processor",
             "stopping_criteria",
@@ -734,7 +821,8 @@ class GenerationConfig(PushToHubMixin):
         except ValueError as exc:
             raise ValueError(
                 "The generation config instance is invalid -- `.validate()` throws warnings and/or exceptions. "
-                "Fix these issues to save the configuration.\n\nThrown during validation:\n" + str(exc)
+                "Fix these issues to save the configuration.\n\nThrown during validation:\n"
+                + str(exc)
             )
 
         use_auth_token = kwargs.pop("use_auth_token", None)
@@ -750,10 +838,14 @@ class GenerationConfig(PushToHubMixin):
                 )
             kwargs["token"] = use_auth_token
 
-        config_file_name = config_file_name if config_file_name is not None else GENERATION_CONFIG_NAME
+        config_file_name = (
+            config_file_name if config_file_name is not None else GENERATION_CONFIG_NAME
+        )
 
         if os.path.isfile(save_directory):
-            raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
+            raise AssertionError(
+                f"Provided path ({save_directory}) should be a directory, not a file"
+            )
 
         os.makedirs(save_directory, exist_ok=True)
 
@@ -872,7 +964,9 @@ class GenerationConfig(PushToHubMixin):
         >>> unused_kwargs
         {'foo': False}
         ```"""
-        config_file_name = config_file_name if config_file_name is not None else GENERATION_CONFIG_NAME
+        config_file_name = (
+            config_file_name if config_file_name is not None else GENERATION_CONFIG_NAME
+        )
 
         resume_download = kwargs.pop("resume_download", None)
         proxies = kwargs.pop("proxies", None)
@@ -952,15 +1046,21 @@ class GenerationConfig(PushToHubMixin):
         if is_local:
             logger.info(f"loading configuration file {resolved_config_file}")
         else:
-            logger.info(f"loading configuration file {configuration_file} from cache at {resolved_config_file}")
+            logger.info(
+                f"loading configuration file {configuration_file} from cache at {resolved_config_file}"
+            )
 
         if kwargs.get("return_unused_kwargs") is True:
             config, unused_kwargs = cls.from_dict(config_dict, **kwargs)
-            config._original_object_hash = hash(config)  # Hash to detect whether the instance was modified
+            config._original_object_hash = hash(
+                config
+            )  # Hash to detect whether the instance was modified
             return config, unused_kwargs
         else:
             config = cls.from_dict(config_dict, **kwargs)
-            config._original_object_hash = hash(config)  # Hash to detect whether the instance was modified
+            config._original_object_hash = hash(
+                config
+            )  # Hash to detect whether the instance was modified
             return config
 
     @classmethod
@@ -1009,7 +1109,9 @@ class GenerationConfig(PushToHubMixin):
         converts torch.dtype to a string of just the type. For example, `torch.float32` get converted into *"float32"*
         string, which can then be stored in the json format.
         """
-        if d.get("torch_dtype", None) is not None and not isinstance(d["torch_dtype"], str):
+        if d.get("torch_dtype", None) is not None and not isinstance(
+            d["torch_dtype"], str
+        ):
             d["torch_dtype"] = str(d["torch_dtype"]).split(".")[1]
         for value in d.values():
             if isinstance(value, dict):
@@ -1032,7 +1134,11 @@ class GenerationConfig(PushToHubMixin):
 
         # only serialize values that differ from the default config
         for key, value in config_dict.items():
-            if key not in default_config_dict or key == "transformers_version" or value != default_config_dict[key]:
+            if (
+                key not in default_config_dict
+                or key == "transformers_version"
+                or value != default_config_dict[key]
+            ):
                 serializable_config_dict[key] = value
 
         self.dict_torch_dtype_to_str(serializable_config_dict)
@@ -1059,7 +1165,9 @@ class GenerationConfig(PushToHubMixin):
         self.dict_torch_dtype_to_str(output)
         return output
 
-    def to_json_string(self, use_diff: bool = True, ignore_metadata: bool = False) -> str:
+    def to_json_string(
+        self, use_diff: bool = True, ignore_metadata: bool = False
+    ) -> str:
         """
         Serializes this instance to a JSON string.
 
@@ -1084,7 +1192,10 @@ class GenerationConfig(PushToHubMixin):
 
         def convert_keys_to_string(obj):
             if isinstance(obj, dict):
-                return {str(key): convert_keys_to_string(value) for key, value in obj.items()}
+                return {
+                    str(key): convert_keys_to_string(value)
+                    for key, value in obj.items()
+                }
             elif isinstance(obj, list):
                 return [convert_keys_to_string(item) for item in obj]
             else:
@@ -1092,7 +1203,9 @@ class GenerationConfig(PushToHubMixin):
 
         def convert_dataclass_to_dict(obj):
             if isinstance(obj, dict):
-                return {key: convert_dataclass_to_dict(value) for key, value in obj.items()}
+                return {
+                    key: convert_dataclass_to_dict(value) for key, value in obj.items()
+                }
             elif is_dataclass(obj):
                 return obj.to_dict()
             else:
@@ -1103,7 +1216,9 @@ class GenerationConfig(PushToHubMixin):
 
         return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
 
-    def to_json_file(self, json_file_path: Union[str, os.PathLike], use_diff: bool = True):
+    def to_json_file(
+        self, json_file_path: Union[str, os.PathLike], use_diff: bool = True
+    ):
         """
         Save this instance to a JSON file.
 
@@ -1132,7 +1247,9 @@ class GenerationConfig(PushToHubMixin):
         """
         config_dict = model_config.to_dict()
         config_dict.pop("_from_model_config", None)
-        config = cls.from_dict(config_dict, return_unused_kwargs=False, _from_model_config=True)
+        config = cls.from_dict(
+            config_dict, return_unused_kwargs=False, _from_model_config=True
+        )
 
         # Special case: some models have generation attributes set in the decoder. Use them if still unset in the
         # generation config.
@@ -1141,10 +1258,14 @@ class GenerationConfig(PushToHubMixin):
                 default_generation_config = GenerationConfig()
                 decoder_config = config_dict[decoder_name]
                 for attr in config.to_dict().keys():
-                    if attr in decoder_config and getattr(config, attr) == getattr(default_generation_config, attr):
+                    if attr in decoder_config and getattr(config, attr) == getattr(
+                        default_generation_config, attr
+                    ):
                         setattr(config, attr, decoder_config[attr])
 
-        config._original_object_hash = hash(config)  # Hash to detect whether the instance was modified
+        config._original_object_hash = hash(
+            config
+        )  # Hash to detect whether the instance was modified
         return config
 
     def update(self, **kwargs):
@@ -1169,7 +1290,9 @@ class GenerationConfig(PushToHubMixin):
         self.validate()
 
         # Remove all the attributes that were updated, without modifying the input dict
-        unused_kwargs = {key: value for key, value in kwargs.items() if key not in to_remove}
+        unused_kwargs = {
+            key: value for key, value in kwargs.items() if key not in to_remove
+        }
         return unused_kwargs
 
 
@@ -1309,4 +1432,1306 @@ class WatermarkingConfig:
                     correct_value="a positive integer",
                     found_value=self.context_width,
                 ),
+            )
+
+
+@dataclass
+class KNNStore(ABC):
+    """KNN-MT embeddings store abstract class.
+
+    Note: No database implementation takes place in the abstract class.
+
+    Attributes:
+        default_table_prefix (str): (class attribute)
+        default_configuration_table_stem (str): (class attribute)
+        default_embedding_table_stem (str): (class attribute)
+        default_faiss_cache_table_stem (str): (class attribute)
+        default_embedding_dtype (str): (class attribute)
+        default_embedding_batch_size (int): (class attribute)
+        default_target_batch_size (int): (class attribute)
+        default_c (int): (class attribute)
+        table_prefix (str):
+        configuration_table_stem (str):
+        embedding_table_stem (str):
+        faiss_cache_table_stem (str):
+        target_build_table_stem (str):
+        configuration_table_name (str):
+        embedding_table_name (str):
+        faiss_cache_table_name (str):
+        embedding_dim (int):
+        embedding_dtype (str):
+        embedding_batch_size (int):
+        target_batch_size (int):
+        c (int):
+    """
+
+    default_table_prefix = "knn_store"
+    default_configuration_table_stem = "config"
+    default_embedding_table_stem = "embedding"
+    default_faiss_cache_table_stem = "faiss_index"
+    default_embedding_batch_size = 50
+    default_target_batch_size = 50
+    default_embedding_dtype = "float32"
+    default_c = 5
+
+    def __init__(
+        self,
+        embedding_dim=None,
+        table_prefix=None,
+        configuration_table_stem=None,
+        embedding_table_stem=None,
+        faiss_cache_table_stem=None,
+        embedding_batch_size=None,
+        target_batch_size=None,
+        embedding_dtype=None,
+        c=None,
+        **kwargs,
+    ):
+        """Initializes KNNStore instance.
+
+        Note: Subclasses must call `super().__init_()` with all constructor arguments and any `kwargs`
+        needed for subclass implementation of `self._initialize_database(**kwargs)`.
+
+        Args:
+            embedding_dim (int):
+            table_prefix (str):
+            configuration_table_stem (str):
+            embedding_table_stem (str):
+            faiss_cache_table_stem (str):
+            embedding_batch_size (int):
+            target_batch_size (int):
+            embedding_dtype (str):
+            c (int):
+            **kwargs (dict):
+
+        """
+        self.embedding_dim = embedding_dim
+
+        self.table_prefix = (
+            table_prefix if table_prefix is not None else KNNStore.default_table_prefix
+        )
+
+        self.configuration_table_stem = (
+            configuration_table_stem
+            if configuration_table_stem is not None
+            else KNNStore.default_configuration_table_stem
+        )
+
+        self.embedding_table_stem = (
+            embedding_table_stem
+            if embedding_table_stem is not None
+            else KNNStore.default_embedding_table_stem
+        )
+
+        self.faiss_cache_table_stem = (
+            faiss_cache_table_stem
+            if faiss_cache_table_stem is not None
+            else KNNStore.default_faiss_cache_table_stem
+        )
+
+        self.embedding_batch_size = (
+            embedding_batch_size
+            if embedding_batch_size is not None
+            else KNNStore.default_embedding_batch_size
+        )
+
+        self.target_batch_size = (
+            target_batch_size
+            if target_batch_size is not None
+            else KNNStore.default_target_batch_size
+        )
+
+        self.embedding_dtype = (
+            embedding_dtype
+            if embedding_dtype is not None
+            else KNNStore.default_embedding_dtype
+        )
+
+        self.c = c if c is not None else KNNStore.default_c
+
+        self.configuration_table_name = (
+            self.table_prefix + "_" + self.configuration_table_stem
+        )
+        self.embedding_table_name = self.table_prefix + "_" + self.embedding_table_stem
+        self.faiss_cache_table_name = (
+            self.table_prefix + "_" + self.faiss_cache_table_stem
+        )
+
+        self._reset_source_token_embeddings_offset()
+
+        self._initialize_database(**kwargs)
+
+    @staticmethod
+    def _batched(iterable, n):
+        if n < 1:
+            raise ValueError("n must be at least one")
+        it = iter(iterable)
+        while batch := tuple(islice(it, n)):
+            yield batch
+
+    @staticmethod
+    def _convert_faiss_index_to_bytestring(faiss_index):
+        serialized_index = faiss.serialize_index(faiss_index)
+        return serialized_index.tobytes()
+
+    # TODO: Provide KNN batch that does aligning using fast_align. This is going to be kind of a
+    # rough spot in the implementation. Makes me want to get back into C++ and learn fast_align
+    # from scratch, make a python port of it or something. That would be a real selling point
+    # for this module though, as very few people can say they have a sentence aligner in
+    # code (I'm actually not sure I should look and see if someone has done this).
+
+    #
+    # Methods provided as part of base class
+    #
+
+    def ingest(self, knn_batch):
+        for (
+            source_token_ids,
+            target_ids,
+            alignments,
+            source_embeddings,
+            target_embeddings,
+        ) in zip(
+            knn_batch.input_ids_masked,
+            knn_batch.label_ids_masked,
+            knn_batch.alignments,
+            knn_batch.encoder_last_hidden_state_masked,
+            knn_batch.target_hidden_states_masked,
+        ):
+            for source_index, source_token_id in enumerate(source_token_ids):
+                target_index = alignments.get(source_index, None)
+
+                # Ignore any source token that was not aligned to a target token
+                if target_index:
+                    source_token_id = source_token_id
+                    target_token_id = target_ids[target_index]
+                    source_embedding = source_embeddings[source_index]
+                    target_embedding = target_embeddings[target_index]
+                    source_embedding_bytestring = source_embedding.numpy().tobytes()
+                    target_embedding_bytestring = target_embedding.numpy().tobytes()
+                    self._store_corpus_timestep(
+                        source_token_id=source_token_id.item(),
+                        target_token_id=target_token_id.item(),
+                        source_embedding_bytestring=source_embedding_bytestring,
+                        target_embedding_bytestring=target_embedding_bytestring,
+                    )
+
+    def _get_new_faiss_index(self):
+        return faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dim))
+
+    def _get_embedding_dtype(self):
+        # TODO: add support for dtypes other than np.float32
+        if self.embedding_dtype == "float32":
+            embedding_dtype = np.float32
+        else:
+            raise ValueError(f"Unsupported dtype used '{self.embedding_dtype}'")
+
+        return embedding_dtype
+
+    def _increment_source_token_embeddings_offset(self):
+        if self.embedding_batch_size < 1:
+            raise ValueError("Please ensure `embedding_batch_size` is greater than 0.")
+        self._embedding_table_offset += self.embedding_batch_size
+
+    def _reset_source_token_embeddings_offset(self):
+        self._embedding_table_offset = 0
+
+    def _get_valid_embedding_offset_and_batch_size(self):
+        error_first_sentence = (
+            "Please ensure you are not modifying private class members. "
+        )
+
+        if not isinstance(self._embedding_table_offset, int):
+            raise ValueError(
+                f"{error_first_sentence}" "`_embedding_table_offset` must be an `int`."
+            )
+        if isinstance(self._embedding_table_offset, bool):
+            raise ValueError(
+                f"{error_first_sentence}"
+                "`_embedding_table_offset` must be an `int` and not a `bool`."
+            )
+        if self._embedding_table_offset < 0:
+            raise ValueError(
+                f"{error_first_sentence}"
+                "`_embedding_table_offset` must be positive or zero."
+            )
+
+        if not isinstance(self.embedding_batch_size, int):
+            raise ValueError(
+                f"{error_first_sentence}" "`embedding_batch_size` must be an `int`."
+            )
+        if isinstance(self.embedding_batch_size, bool):
+            raise ValueError(
+                f"{error_first_sentence}"
+                "`embedding_batch_size` must be an `int` and not a `bool`."
+            )
+        if self.embedding_batch_size < 1:
+            raise ValueError(
+                f"{error_first_sentence}" "`embedding_batch_size` must be positive."
+            )
+
+        return self._embedding_table_offset, self.embedding_batch_size
+
+    def _add_bytestrings_to_faiss_index(
+        self, faiss_index, batch_ids, batch_bytestrings
+    ):
+        batch_embeddings_np = np.array(
+            [
+                np.frombuffer(embedding, dtype=self._get_embedding_dtype())
+                for embedding in batch_bytestrings
+            ]
+        )
+        batch_ids_np = np.array(batch_ids, dtype=np.int64)
+        faiss.normalize_L2(batch_embeddings_np)
+        faiss_index.add_with_ids(batch_embeddings_np, batch_ids_np)
+
+    def build_source_index(self):
+        faiss_index = self._get_new_faiss_index()
+        source_token_ids = self._retrieve_all_source_token_ids()
+
+        # One source token ID at a time
+        for (source_token_id,) in (batches := tqdm(source_token_ids)):
+            batches.set_description(
+                f"Building index for source token ID {source_token_id}"
+            )
+
+            embedding_batches = self._retrieve_source_token_embeddings_batches(
+                source_token_id
+            )
+
+            while rows := next(embedding_batches):
+                batch_ids, batch_bytestrings = zip(*rows)
+                self._add_bytestrings_to_faiss_index(
+                    faiss_index, batch_ids, batch_bytestrings
+                )
+
+            bytestring = KNNStore._convert_faiss_index_to_bytestring(faiss_index)
+            self._store_source_faiss_bytestring(source_token_id, bytestring)
+            faiss_index.reset()
+
+    def get_source_token_faiss_index(self, source_token_id):
+        bytestring = self._retrieve_source_faiss_bytestring(source_token_id)
+        if bytestring is not None:
+            return faiss.deserialize_index(np.frombuffer(bytestring, dtype=np.uint8))
+        return None
+
+    def knn_source_faiss_index(self, source_token_id, source_embedding, k):
+        faiss_index = self.get_source_token_faiss_index(source_token_id)
+
+        # TODO: Write the faiss stuff to perform the k nearest neighbor search here
+        # and return the list of ids
+
+    def knn_get_logits(self):
+        # TODO: Figure out how this all comes together. Need to review math. It's something like
+        # calling knn_source_faiss_index() above and then calling build_target_faiss_index(), then
+        # searching that index with the target and getting the top k matching target tokens, then
+        # going to the math to interpolate with existing model. that will be another class that
+        # composes this probably, KNNOperator or something.
+        return True
+
+    def build_target_datastore(
+        self,
+        encoder_input_ids,
+        encoder_last_hidden_state,
+        c=None,
+    ):
+        """Builds one target datastore faiss index for each sequence in the batch
+        TODO: ROY: Finish this docstring
+        """
+
+        c = c if c is not None else self.c
+
+        batch_size = encoder_input_ids.shape[0]
+        self.target_datastore = [None] * batch_size
+
+        for index in (batches := tqdm(range(batch_size))):
+            batches.set_description(f"Building target datastore batch {index}")
+
+            queries = {}
+
+            # Gather faiss indices for each source_token_id in the sequence along with the queries for each
+            for source_token_id, source_embedding in zip(
+                encoder_input_ids[index], encoder_last_hidden_state[index]
+            ):
+                source_token_id = source_token_id.item()
+
+                if queries.get(source_token_id, None) is None:
+                    faiss_index = self.get_source_token_faiss_index(source_token_id)
+                    if faiss_index is not None:
+                        queries[source_token_id] = KNNStore.__FaissQueries__(
+                            faiss_index=faiss_index,
+                            embedding_dim=self.embedding_dim,
+                            embedding_dtype=self._get_embedding_dtype(),
+                            k=c,
+                        )
+                    else:
+                        queries[source_token_id] = "no_index"
+
+                if isinstance(queries[source_token_id], KNNStore.__FaissQueries__):
+                    queries[source_token_id].add_query(source_embedding)
+
+            unique_source_token_ids = queries.keys()
+
+            if len(unique_source_token_ids) > 0:
+                self.target_datastore[index] = KNNStore.__FaissQueries__(
+                    faiss_index=self._get_new_faiss_index(),
+                    embedding_dim=self.embedding_dim,
+                    embedding_dtype=self._get_embedding_dtype(),
+                )
+
+            # Run bulk queries against faiss indices for each source token
+            for source_token_id in unique_source_token_ids:
+                # TODO: ROY: Parameterize based on preferences / environment the `use_gpu` flag
+                if isinstance(queries[source_token_id], KNNStore.__FaissQueries__):
+                    _, embedding_ids = queries[source_token_id].run(use_gpu=True)
+                    unique_embedding_ids = np.unique(embedding_ids.flatten())
+                    rows = self._retrieve_target_bytestrings(
+                        unique_embedding_ids[unique_embedding_ids > 0].tolist()
+                    )
+                    batch_ids, batch_bytestrings = zip(*rows)
+                    self._add_bytestrings_to_faiss_index(
+                        self.target_datastore[index].faiss_index,
+                        batch_ids,
+                        batch_bytestrings,
+                    )
+
+    def search_target_datastore(
+        self,
+        decoder_last_hidden_state: torch.FloatTensor,
+        k: int,
+        unfinished_sequences: torch.LongTensor,
+        pad_token_id: int = None,
+        return_probs: bool = None,
+        vocab_dim: int = None,
+        temperature: float = None,
+    ):
+        """Returns the top k target tokens from datastore.
+        TODO: ROY: Finish this docstring
+        """
+        embedding_dtype = self._get_embedding_dtype()
+
+        # TODO: ROY: Try moving all of these tensors to the GPU For the search computations
+        # then taking them back off (detaching) at the end
+
+        batch_l2_distances = np.empty((0, k), dtype=embedding_dtype)
+        batch_target_token_ids = np.empty((0, k), dtype=np.int64)
+
+        pad_token_id = pad_token_id if pad_token_id is not None else 0
+
+        for query_embedding, faiss_queries, sequence_is_unfinished in zip(
+            decoder_last_hidden_state,
+            self.target_datastore,
+            unfinished_sequences == 1,
+        ):
+            if sequence_is_unfinished and faiss_queries is not None:
+                faiss_queries.add_query(query_embedding)
+
+                # TODO: ROY: Parameterize `use_gpu` based on whether GPU is available
+                l2_distances, embedding_ids = faiss_queries.run(k=k, use_gpu=True)
+
+                print(l2_distances, embedding_ids)
+
+                target_token_ids = np.array(
+                    self._retrieve_target_token_ids(tuple(embedding_ids[0])),
+                    dtype=np.int64,
+                ).reshape((1, -1))
+
+                faiss_queries.clear_queries()
+            else:
+                # Cut down on computational complexity for finished sequences
+                l2_distances = np.zeros((1, k), dtype=embedding_dtype)
+                target_token_ids = np.full(
+                    (1, k), fill_value=pad_token_id, dtype=np.int64
+                )
+
+            batch_l2_distances = np.concatenate(
+                (batch_l2_distances, l2_distances), axis=0
+            )
+            batch_target_token_ids = np.concatenate(
+                (batch_target_token_ids, target_token_ids), axis=0
+            )
+
+        if not return_probs:
+            return batch_l2_distances, batch_target_token_ids
+
+        if vocab_dim is None:
+            raise ValueError(
+                "Missing required parameter `vocab_dim` necessary for calculating logits."
+            )
+
+        if temperature is None:
+            raise ValueError(
+                "Missing required parameter `temperature` necessary for calculating logits."
+            )
+
+        batch_size = batch_l2_distances.shape[0]
+
+        # shape (batch_size, k, vocab_dim)
+        one_hot_tokens = np.zeros(
+            (batch_size, k, vocab_dim), dtype=self._get_embedding_dtype()
+        )
+
+        for i in range(batch_size):
+            for j in range(k):
+                one_hot_tokens[i, j, batch_target_token_ids[i, j]] = (
+                    # any token IDs coming back from faiss as -1 should not be considered
+                    1
+                    if batch_target_token_ids[i, j] != -1
+                    else 0
+                )
+
+        # TODO: ROY: Investigate whether it would work to strip away the np.exp( part here
+        # and just return scores (I don't think so--normalization of values would be weird)
+
+        # shape (batch_size, k)
+        exp_term = np.exp(-batch_l2_distances / temperature)
+
+        # Replace any infinitesimal or zero values in `exp_term` with epsilon
+        epsilon = 1e-7
+        exp_term[exp_term < epsilon] = epsilon
+
+        # shape (batch_size, k, vocab_dim)
+        V = one_hot_tokens * exp_term.reshape(batch_size, k, 1)
+
+        # shape (batch_size, 1, 1)
+        Z = np.sum(exp_term, axis=1).reshape(batch_size, 1, 1)
+
+        # shape (batch_size, k, vocab_dim)
+        knn_probs_per_candidate = V / Z
+
+        # `knn_probs` has shape (batch_size, vocab_dim)
+        knn_probs = np.sum(knn_probs_per_candidate, axis=1)
+
+        return knn_probs
+
+    def validate(self):
+        """Validate the KNNStore instance.
+
+        Verifies that the instances is of type KNNStore and that the basic required attributes
+        are in place. Raises an exception when invalid.
+        """
+
+        if not isinstance(self, KNNStore) or not (
+            hasattr(self, 'embedding_dim')
+            and hasattr(self, 'embedding_dtype')
+            and hasattr(self, 'embedding_batch_size')
+            and hasattr(self, 'target_batch_size')
+            and hasattr(self, 'c')
+        ):
+            raise ValueError(
+                "Please sure the KNNStore instance is valid and properly constructed."
+            )
+
+    #
+    # Abstract methods that must be implemented in subclass
+    #
+
+    @abstractmethod
+    def _initialize_database(self, **kwargs):
+        """Initialize DB. This is an abstract method.
+
+        This function initializes the DB with the tables required for the KNN store to run. This
+        includes four tables:
+
+        - Table 1: Configuration
+        - Table 2: Timesteps. Source and target token IDs and embeddings per timestep
+        - Table 3: Faiss indices storing encoder embeddings across each source token ID
+
+        Table 1: Configuration key/value pairs
+            >Default table name is `knn_store_config`
+            >In code, known as `self.configuration_table_name`
+            - name:
+                String. Name of the configuration. Primary key.
+            - value:
+                String. Value of the configuration.
+
+        Table 2: Source and target token IDs and embeddings per timestep
+            >Default table name is `knn_store_embedding`
+            >In code, known as `self.embedding_table_name`
+            - id:
+                Source-side ID. System-generated. Represents a unique source token occurrence
+                within the corpus. The aligned target token ID and target embedding can be
+                referenced by this universal ID as well.
+
+            - source_token_id:
+                The token type ID (kind of token) at this location in the source. Depends on
+                the tokenizer used upstream. Can be used as a way to group source embeddings,
+                target tokens, and target embeddings by the source token type.
+
+            - target_token_id:
+                The token type ID (kind of token) of the target token that was aligned to
+                the source token during the alignment process.
+
+            - source_embedding:
+                The embedding of the source token at this position. This assignment depends on
+                the upstream embeddings model and how the output is generated, but usually it is
+                the embedding created by the encoder in an encoder/decoder transformer architecture.
+
+            - target_embedding:
+                The embedding of the target token at this position. Usually the embedding from
+                the last hidden state of the decoder at the timestep t of this particular
+                position in the corpus, taking into account the whole source, and all target
+                tokens up to the point t in the sequence.
+
+
+        Table 3: Faiss indices storing encoder embeddings across each source token ID
+            >Default table name is `knn_store_faiss_index`
+            >In code, known as `self.faiss_cache_table_name`
+            - source_token_id:
+                The token type ID of the source token for which the list of embeddings are being
+                pulled for vector search.
+            - faiss_index:
+                The byte data for a serialized FAISS index using `faiss.serialize_index(index)`.
+
+
+        Note: Each of these tables must be implemented according to the type of database chosen
+              for the subclass.
+
+        Note: Source tokens without a corresponding entry in `alignments` property of input batch
+              to `KNNStore.ingest(input_batch)` (in other words, source tokens that were not able to be
+              aligned to target tokens) will be ignored and their related embeddings will not be stored.
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Args:
+            **kwargs:
+                Keyword arguments needed to initialize the DB.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_initialize_database` in a subclass and pass any necessary "
+            "`**kwargs` for DB initialization to the base class constructor when constructing "
+            "the subclass."
+        )
+
+    @abstractmethod
+    def _store_corpus_timestep(
+        self,
+        source_token_id,
+        target_token_id,
+        source_embedding_bytestring,
+        target_embedding_bytestring,
+    ):
+        """Store source and target token IDs and embeddings for single timestep. This is an abstract method.
+
+        Args:
+            source_token_id (int):
+            target_token_id (int):
+            source_embedding_bytestring (bytes):
+            target_embedding_bytestring (bytes):
+
+        Stores the following in Table 2 in the DB:
+
+        source_token_id (int),
+        target_token_id (int),
+        source_embedding (blob/bytea),
+        target_embedding (blob/bytea)
+
+        Table 2: Source and target token IDs and embeddings per timestep
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_store_corpus_timestep` in a subclass."
+        )
+
+    @abstractmethod
+    def _retrieve_all_source_token_ids(self):
+        """Retrieve all source token IDs from Table 2. This is an abstract method.
+
+        Retrieves `source_token_id` across all rows in Table 2 in the DB.
+
+        Table 2: Source and target token IDs and embeddings per timestep
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Returns:
+            tuple(int): All source token IDs stored in Table 2.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_retrieve_all_source_token_ids` in a subclass."
+        )
+
+    @abstractmethod
+    def _retrieve_source_token_embeddings_batches(self, source_token_id):
+        """Retrieves one batch of source token embeddings from the DB. This is an abstract method.
+
+        GENERATOR FUNCTION.
+
+        Yields a single batch of `source_embedding` fields from Table 2. Retrieves one batch
+        according to self._embedding_table_offset and self.embedding_batch_size. Usually this
+        will be implemented using something akin to `offset` and `limit` in the DB, and utizing
+        an `order by` clause to ensure the offset and limit remain meaningful between function calls.
+
+        Note: Must call `self._increment_source_token_embeddings_offset()` before yielding each batch.
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Args:
+            source_token_id (int): Source token ID for which embeddings are retrieved.
+
+        Yields:
+            tuple((int, bytes)):
+                Tuple of two-element tuples. First element in each two-element tuple is the ID of the
+                individual timestep stored in Table 2. Second element in each two-element tuple is the
+                bytestring corresponding to the last encoder hidden state for source token at timestep.
+                When no more data exists, should yield an empty tuple.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_retrieve_source_token_embeddings_batches` in a subclass."
+        )
+
+    @abstractmethod
+    def _store_source_faiss_bytestring(self, source_token_id, bytestring):
+        """Stores faiss index for source embeddings across one source token ID. This is an abstract method.
+
+        Stores the faiss index represented in the `bytestring` parameter in Table 3, overwriting any
+        previous faiss index bytestring stored for this particular source_token_id. This is done using
+        a DB transaction, so an index will only be removed if it is certainly being replaced by another.
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Args:
+            source_token_id (int):
+                Source token ID for this source embedding index.
+            bytestring (bytes):
+                Bytes that make up the serialized version of the faiss index for this source token ID
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_store_source_faiss_bytestring` in a subclass."
+        )
+
+    @abstractmethod
+    def _retrieve_source_faiss_bytestring(self, source_token_id):
+        """Retrieves bytestring of serialized faiss index containing all source embeddings for
+        a given source token. This is an abstract method.
+
+        Retrieves serialized faiss index corresponding to the given `source_token_id` as a
+        bytestring from the DB. Will return just the bytestring, not the row returned from
+        the DB connection utility.
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Args:
+            source_token_id (int):
+                Source token ID for this source embedding faiss index.
+
+        Returns:
+            bytes: Bytestring of faiss index corresponding to `source_token_id`.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_retrieve_source_faiss_bytestring` in a subclass."
+        )
+
+    @abstractmethod
+    def _retrieve_target_bytestrings(self, embedding_ids):
+        """Retrieves target token embeddings corresponding to a list of Table 2 IDs.
+
+        Retrieves all target token embeddings according to a list of Table 2 IDs (`embedding_ids`).
+        The format of the return should be a tuple of rows where each row is a two-element tuple:
+
+        Ex: ((embedding_id1, target_embedding1), (embedding_id2, target_embedding2))
+
+        If no data is found for the given `embedding_ids`, an empty tuple (`()`) should be returned.
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Args:
+            embedding_ids (list):
+                Table 2 row IDs for which to retrieve the `target_embedding` values.
+
+        Returns:
+            tuple(tuple(int, bytes)): A tuple of two-element tuples, each containing the timestep /
+            embedding ID and the bytestring of the faiss index respectively.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_retrieve_target_bytestrings` in a subclass."
+        )
+
+    @abstractmethod
+    def _retrieve_target_token_ids(self, embedding_ids):
+        """Retrieves target token IDs to a list of Table 2 IDs.
+
+        Retrieves all target token IDs according to a list of Table 2 IDs (`embedding_ids`).
+        The format of the return should be a tuple of integer target token IDs:
+
+        Ex: (target_token_id1, target_token_id2, ...)
+
+        If no data is found for the given `embedding_ids`, an empty tuple (`()`) should be returned.
+
+        Note: No database implementation is given. Use one of the subclasses for a particular
+        type of database.
+
+        Args:
+            embedding_ids (list):
+                Table 2 row IDs for which to retrieve the `target_token_id` values.
+
+        Returns:
+            tuple(int): A tuple of integer target token IDs.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_retrieve_target_token_ids` in a subclass."
+        )
+
+    class __FaissQueries__(dict):
+        """Helper to contain one faiss index with queries.
+
+        Attributes:
+            faiss_index (faiss.swigfaiss_avx2.IndexIDMap):
+                The fully initialized FAISS index stored on the CPU with vectors preloaded. Required for
+                construction of `__FaissQueries__` object. Note: only CPU-stored faiss indices should be
+                passed, as the index will be moved to the GPU at query time and then removed after.
+            embedding_dim (int):
+                The dimensionality of the query embeddings. Required for construction of `__FaissQueries__` object.
+            embedding_dtype (type):
+                The data type of the query embeddings. Defaults to `numpy.float32`.
+            queries (ndarray(`embedding_dtype`)):
+                Array of size (N, `embedding_dim`) where N is the number of query embeddings added. This will be
+                directly used as input to `faiss_index.search()`.
+            k (int):
+                The number of nearest neighbors to return data for when running queries against the stored
+                `faiss_index`. Defaults to 3.
+        """
+
+        def __init__(
+            self, faiss_index=None, embedding_dim=None, embedding_dtype=None, k=None
+        ):
+            """Initialize a faiss index queries container.
+
+            Args:
+                faiss_index (faiss.swigfaiss_avx2.IndexIDMap):
+                    The fully initialized FAISS index with vectors preloaded. Note: only CPU-stored faiss
+                    indices should be passed, as the index will be moved to the GPU at query time and then
+                    removed after.
+                embedding_dim (int):
+                    The dimensionality of the query embeddings. Required for construction of `__FaissQueries__` object.
+                embedding_dtype (type):
+                    The data type of the query embeddings. Defaults to `numpy.float32`.
+                k (int):
+                    The number of nearest neighbors to return data for when running queries against
+                    the stored `faiss_index`. Defaults to 3.
+            """
+            if faiss_index is None:
+                raise ValueError("Missing required parameter `faiss_index`.")
+
+            if embedding_dim is None:
+                raise ValueError("Missing required parameter `embedding_dim`.")
+
+            self.faiss_index = faiss_index
+
+            self.embedding_dim = embedding_dim
+            self.embedding_dtype = (
+                embedding_dtype if embedding_dtype is not None else np.float32
+            )
+
+            self.k = k if k is not None else 3
+
+            self.queries = np.empty((0, self.embedding_dim), dtype=self.embedding_dtype)
+
+        def add_query(self, query_embedding):
+            """Add one embedding to the list of query embeddings for this faiss index.
+
+            Args:
+                query_embedding (ndarray):
+                    1D array of size (`embedding_dim`) to be concatenated with existing queries. Data type is
+                    determined by attribute `embedding_dtype`, set during construction.
+            """
+            if len(query_embedding.shape) > 1:
+                raise ValueError(
+                    "Parameter `query_embedding` (ndarray) must have only one dimension."
+                )
+
+            if query_embedding.shape[0] != self.embedding_dim:
+                raise ValueError(
+                    f"Parameter `query_embedding` (ndarray) of dimension {query_embedding.shape[0]} "
+                    f"does not match configured `embedding_dim` of {self.embedding_dim}. Please "
+                    f"only pass query embeddings of dimension {self.embedding_dim}."
+                )
+
+            self.queries = np.concatenate(
+                (self.queries, query_embedding[np.newaxis, :])
+            )
+
+        def clear_queries(self):
+            """Clear all queries from the FaissQueries instance."""
+            self.queries = np.empty((0, self.embedding_dim), dtype=self.embedding_dtype)
+
+        def run(self, k=None, use_gpu=None):
+            """Run all queries currently stored in the container.
+
+            Runs all queries stored in `queries` against `faiss_index`.
+
+            Args:
+                k (int):
+                    The number of nearest neighbors for which to return data when running queries against
+                    the stored `faiss_index`. Defaults to `self.k` on the object, which defaults to 3
+                    when not specified at construction time.
+                use_gpu (bool):
+                    Whether to place the index on the GPU prior to searching. This also implies that the
+                    index is automatically deallocated (by calling `faiss_index.reset()`) after the search
+                    is complete.
+
+            Returns:
+                tuple(ndarray, ndarray):
+                    A tuple with first element containing the matrix of L2 distances from the query vector
+                    to the neighbor at that column for the query at that row. The second element is the
+                    matrix of IDs for the neighbor at that column for the query at that row.
+            """
+            k = k if k is not None else self.k
+
+            # use_gpu = use_gpu if use_gpu is not None else False
+
+            # TODO: ROY: `faiss-gpu` package is unreliable for newer CUDA versions. Need to use the
+            # wheel, but that means figuring out a place to store the wheel and how to integrate it
+            # into the Hugging Face setup script. For now, run faiss on CPU and complete testing
+            # and debugging, face this problem last.
+            use_gpu = False
+
+            if use_gpu:
+                # TODO: ROY: Expand this to support multiple GPUs / GPU array
+                # Should be something like the following:
+                # gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
+                res = faiss.StandardGpuResources()
+                faiss_index = faiss.index_cpu_to_gpu(res, 0, self.faiss_index)
+            else:
+                faiss_index = self.faiss_index
+
+            distance, ids = faiss_index.search(self.queries, k)
+
+            if use_gpu:
+                faiss_index.reset()
+
+            return distance, ids
+
+
+# Allowed kwargs passed to `sqlite.connect()`
+SQLITE_CONNECT_KWARGS = [
+    "cached_statements",
+    "check_same_thread",
+    "database",
+    "detect_types",
+    "factory",
+    "isolation_level",
+    "timeout",
+    "uri",
+]
+
+
+def extract_key_value_pairs_from_dict(original_dict, subset_keys):
+    subset = {}
+    keys = [key for key in original_dict.keys()]
+    for key in keys:
+        if key in subset_keys and original_dict.get(key, None) is not None:
+            subset[key] = original_dict.pop(key)
+    return subset
+
+
+@dataclass
+class KNNStoreSQLite(KNNStore):
+    """KNN-MT embeddings store for SQLite.
+
+    Attributes:
+        sqlite_connect_kwargs (dict):
+
+    """
+
+    schema = 'public'
+
+    def __init__(
+        self,
+        embedding_dim=None,
+        table_prefix=None,
+        configuration_table_stem=None,
+        embedding_table_stem=None,
+        faiss_cache_table_stem=None,
+        embedding_batch_size=None,
+        target_batch_size=None,
+        embedding_dtype=None,
+        c=None,
+        **kwargs,
+    ):
+        """Initializes KNNStore instance.
+
+        Passes relevant `**kwargs` to `sqlite3.connect()` for initialization or restoriation
+        of the DB. To initialize in the simplest form, pass `database="your-db-path.db"` and
+        a SQLite DB will be either opened or created at "your-db-path.db". See the docs for
+        Python's implementation of SQLite here: https://docs.python.org/3/library/sqlite3.html
+
+        Note: The user of `:memory:` as the `database` parameter for `sqlite3.connect()` is
+        allowed but not recommended for this use case, as the size of the DB can grow large
+        quite quickly when storing high-dimensionality embeddings.
+
+        Args:
+            embedding_dim (int):
+            table_prefix (str):
+            configuration_table_stem (str):
+            embedding_table_stem (str):
+            faiss_cache_table_stem (str):
+            embedding_batch_size (int):
+            target_batch_size (int):
+            embedding_dtype (str):
+            c (int):
+            **kwargs (dict):
+        """
+
+        self.sqlite_connect_kwargs = extract_key_value_pairs_from_dict(
+            kwargs, SQLITE_CONNECT_KWARGS
+        )
+
+        if len(self.sqlite_connect_kwargs) < 1:
+            raise ValueError(
+                "Please specify keyword arguments to intialize database during construction of `KNNStoreSQLite` instance."
+            )
+
+        super(KNNStoreSQLite, self).__init__(
+            embedding_dim=embedding_dim,
+            table_prefix=table_prefix,
+            configuration_table_stem=configuration_table_stem,
+            embedding_table_stem=embedding_table_stem,
+            faiss_cache_table_stem=faiss_cache_table_stem,
+            embedding_batch_size=embedding_batch_size,
+            target_batch_size=target_batch_size,
+            embedding_dtype=embedding_dtype,
+            c=c,
+        )
+
+    @staticmethod
+    def _validate_table_name(table_name):
+        safe_table_name_pattern = r"^[\p{L}_][\p{L}\p{N}@$#_]{0,127}$"
+        if not re.match(safe_table_name_pattern, table_name):
+            raise ValueError(f"Invalid table name supplied: '{table_name}'.")
+        return table_name
+
+    def _get_sqlite_connection(self):
+        return sqlite3.connect(**self.sqlite_connect_kwargs)
+
+    def _initialize_database(self):
+        """Initialize database for SQLite"""
+
+        print(
+            f"Creating SQLite database using configuration: {self.sqlite_connect_kwargs}."
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        # Prevent SQL injections to table names
+        valid_configuration_table_name = KNNStoreSQLite._validate_table_name(
+            self.configuration_table_name
+        )
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+        valid_faiss_cache_table_name = KNNStoreSQLite._validate_table_name(
+            self.faiss_cache_table_name
+        )
+
+        print(
+            f"Creating table '{valid_configuration_table_name}' if it does not exist."
+        )
+        create_configuration_table_query = (
+            f"create table if not exists {valid_configuration_table_name} ( "
+            "   name text not null primary key, "
+            "   value text "
+            ");"
+        )
+        cur.execute(create_configuration_table_query)
+        con.commit()
+
+        print(
+            f"Loading any past configurations from table '{valid_configuration_table_name}."
+        )
+        load_configurations_query = (
+            f"select name, value from {valid_configuration_table_name};"
+        )
+        cur.execute(load_configurations_query)
+        rows = cur.fetchall()
+
+        for name, value in rows:
+            if value != 'None':
+                if name == 'embedding_dtype':
+                    self.embedding_dtype = value
+                elif name == 'embedding_dim':
+                    self.embedding_dim = int(value)
+
+        if self.embedding_dim is None:
+            raise ValueError("Missing required parameter `embedding_dim`.")
+
+        print(f"Upserting configurations in '{valid_configuration_table_name}'")
+        upsert_embedding_dtype_query = (
+            f"insert into {valid_configuration_table_name} (name, value) "
+            "values ('embedding_dtype', ?) "
+            "on conflict(name) do update set value = ?;"
+        )
+        upsert_embedding_dim_query = (
+            f"insert into {valid_configuration_table_name} (name, value) "
+            "values ('embedding_dim', ?) "
+            "on conflict(name) do update set value = ?;"
+        )
+
+        cur.execute(
+            upsert_embedding_dtype_query,
+            (
+                self.embedding_dtype,
+                self.embedding_dtype,
+            ),
+        )
+        cur.execute(
+            upsert_embedding_dim_query,
+            (
+                str(self.embedding_dim),
+                str(self.embedding_dim),
+            ),
+        )
+        con.commit()
+
+        print(f"Creating table '{valid_embedding_table_name}' if it does not exist.")
+        create_embedding_table_query = (
+            f"create table if not exists {valid_embedding_table_name} ( "
+            "    id integer primary key autoincrement, "
+            "    source_token_id integer, "
+            "    target_token_id integer, "
+            "    source_embedding blob, "
+            "    target_embedding blob "
+            ");"
+        )
+        cur.execute(create_embedding_table_query)
+        con.commit()
+
+        print(f"Creating table '{valid_faiss_cache_table_name}' if it does not exist.")
+        create_faiss_cache_table_query = (
+            f"create table if not exists {valid_faiss_cache_table_name} ( "
+            "    source_token_id integer not null unique, "
+            "    faiss_index blob "
+            ");"
+        )
+        cur.execute(create_faiss_cache_table_query)
+        con.commit()
+
+        cur.execute(f"select name, value from {valid_configuration_table_name};")
+        configurations = cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        print(f"Current {self.__class__.__name__} instance configurations:")
+        print(configurations)
+
+    def _store_corpus_timestep(
+        self,
+        source_token_id,
+        target_token_id,
+        source_embedding_bytestring,
+        target_embedding_bytestring,
+    ):
+        valid_embedding_table_name = self._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        insert_embedding_query = (
+            f"insert into {valid_embedding_table_name} (source_token_id, target_token_id, source_embedding, target_embedding) "
+            "values (?, ?, ?, ?);"
+        )
+
+        cur.execute(
+            insert_embedding_query,
+            (
+                source_token_id,
+                target_token_id,
+                source_embedding_bytestring,
+                target_embedding_bytestring,
+            ),
+        )
+        con.commit()
+
+        cur.close()
+        con.close()
+
+    def _retrieve_all_source_token_ids(self):
+        valid_embedding_table_name = self._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        # Get unique source token IDs to iterate over
+        cur.execute(
+            f"select distinct source_token_id from {valid_embedding_table_name};"
+        )
+
+        source_token_ids = cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        return source_token_ids
+
+    def _retrieve_source_token_embeddings_batches(self, source_token_id):
+        valid_embedding_table_name = self._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        self._reset_source_token_embeddings_offset()
+
+        while self._embedding_table_offset == 0 or len(rows) > 0:
+            valid_embedding_table_offset, valid_embedding_batch_size = (
+                self._get_valid_embedding_offset_and_batch_size()
+            )
+
+            source_embedding_query = (
+                "select id, source_embedding "
+                f"from {valid_embedding_table_name} "
+                "where source_token_id = ? and target_token_id is not null "
+                "order by id "
+                f"limit {valid_embedding_batch_size} "
+                f"offset {valid_embedding_table_offset};"
+            )
+
+            cur.execute(
+                source_embedding_query,
+                (source_token_id,),
+            )
+            rows = cur.fetchall()
+            self._increment_source_token_embeddings_offset()
+            yield rows
+
+        cur.close()
+        con.close()
+
+    def _store_source_faiss_bytestring(self, source_token_id, bytestring):
+        valid_faiss_cache_table_name = self._validate_table_name(
+            self.faiss_cache_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        cur.execute(
+            f"delete from {valid_faiss_cache_table_name} where source_token_id = ?;",
+            (source_token_id,),
+        )
+        cur.execute(
+            f"insert into {valid_faiss_cache_table_name} (source_token_id, faiss_index) values (?, ?);",
+            (
+                source_token_id,
+                bytestring,
+            ),
+        )
+        con.commit()
+
+        cur.close()
+        con.close()
+
+    def _retrieve_source_faiss_bytestring(self, source_token_id):
+        valid_faiss_cache_table_name = self._validate_table_name(
+            self.faiss_cache_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        cur.execute(
+            f"select faiss_index from {valid_faiss_cache_table_name} where source_token_id = ?;",
+            (int(source_token_id),),
+        )
+
+        result = cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        if len(result) < 1 or len(result[0]) < 1:
+            return None
+
+        bytestring = result[0][0]
+
+        return bytestring
+
+    def _retrieve_target_bytestrings(self, embedding_ids):
+        valid_embedding_table_name = self._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        placeholders = len(embedding_ids) * '?'
+
+        cur.execute(
+            f"select id, target_embedding from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
+            embedding_ids,
+        )
+        rows = cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        return rows
+
+    def _retrieve_target_token_ids(self, embedding_ids):
+        # TODO: ROY: Finish docstring
+        embedding_ids_len = (
+            len(embedding_ids) if isinstance(embedding_ids, tuple) else 0
+        )
+
+        if embedding_ids_len < 1:
+            return ()
+
+        valid_embedding_table_name = self._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        unique_embedding_ids = tuple(set(embedding_ids))
+        placeholders = len(unique_embedding_ids) * '?'
+
+        cur.execute(
+            f"select id, target_token_id from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
+            tuple(int(embedding_id) for embedding_id in unique_embedding_ids),
+        )
+
+        rows = cur.fetchall()
+
+        target_token_dict = {
+            embedding_id: target_token_id for (embedding_id, target_token_id) in rows
+        }
+
+        target_token_ids = tuple(
+            target_token_dict.get(embedding_id, -1) for embedding_id in embedding_ids
+        )
+
+        cur.close()
+        con.close()
+
+        return target_token_ids
+
+    def validate(self):
+        """Validate the KNNStoreSQLite instance.
+
+        Verifies that the instances is of type KNNStoreSQLite and that the basic required attributes
+        are in place. Raises an exception when invalid.
+        """
+
+        super(KNNStoreSQLite, self).validate()
+
+        if not isinstance(self, KNNStoreSQLite) or not (
+            hasattr(self, 'sqlite_connect_kwargs')
+        ):
+            raise ValueError(
+                "Please sure the KNNStoreSQLite instance is valid and properly constructed."
             )

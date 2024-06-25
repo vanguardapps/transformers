@@ -14,11 +14,22 @@
 
 from typing import TYPE_CHECKING
 
-from ..utils import OptionalDependencyNotAvailable, _LazyModule, is_flax_available, is_tf_available, is_torch_available
+from ..utils import (
+    OptionalDependencyNotAvailable,
+    _LazyModule,
+    is_flax_available,
+    is_tf_available,
+    is_torch_available,
+)
 
 
 _import_structure = {
-    "configuration_utils": ["GenerationConfig", "GenerationMode", "WatermarkingConfig"],
+    "configuration_utils": [
+        "GenerationConfig",
+        "GenerationMode",
+        "KNNStoreSQLite",
+        "WatermarkingConfig",
+    ],
     "streamers": ["TextIteratorStreamer", "TextStreamer"],
 }
 
@@ -58,6 +69,7 @@ else:
         "ForceTokensLogitsProcessor",
         "HammingDiversityLogitsProcessor",
         "InfNanRemoveLogitsProcessor",
+        "KNNLogitsProcessor",
         "LogitNormalization",
         "LogitsProcessor",
         "LogitsProcessorList",
@@ -179,7 +191,12 @@ else:
     ]
 
 if TYPE_CHECKING:
-    from .configuration_utils import GenerationConfig, GenerationMode, WatermarkingConfig
+    from .configuration_utils import (
+        GenerationConfig,
+        GenerationMode,
+        KNNStoreSQLite,
+        WatermarkingConfig,
+    )
     from .streamers import TextIteratorStreamer, TextStreamer
 
     try:
@@ -188,9 +205,23 @@ if TYPE_CHECKING:
     except OptionalDependencyNotAvailable:
         pass
     else:
-        from .beam_constraints import Constraint, ConstraintListState, DisjunctiveConstraint, PhrasalConstraint
-        from .beam_search import BeamHypotheses, BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
-        from .candidate_generator import AssistedCandidateGenerator, CandidateGenerator, PromptLookupCandidateGenerator
+        from .beam_constraints import (
+            Constraint,
+            ConstraintListState,
+            DisjunctiveConstraint,
+            PhrasalConstraint,
+        )
+        from .beam_search import (
+            BeamHypotheses,
+            BeamScorer,
+            BeamSearchScorer,
+            ConstrainedBeamSearchScorer,
+        )
+        from .candidate_generator import (
+            AssistedCandidateGenerator,
+            CandidateGenerator,
+            PromptLookupCandidateGenerator,
+        )
         from .logits_process import (
             AlternatingCodebooksLogitsProcessor,
             ClassifierFreeGuidanceLogitsProcessor,
@@ -204,6 +235,7 @@ if TYPE_CHECKING:
             ForceTokensLogitsProcessor,
             HammingDiversityLogitsProcessor,
             InfNanRemoveLogitsProcessor,
+            KNNLogitsProcessor,
             LogitNormalization,
             LogitsProcessor,
             LogitsProcessorList,
@@ -317,8 +349,15 @@ if TYPE_CHECKING:
             FlaxTopPLogitsWarper,
             FlaxWhisperTimeStampLogitsProcessor,
         )
-        from .flax_utils import FlaxBeamSearchOutput, FlaxGenerationMixin, FlaxGreedySearchOutput, FlaxSampleOutput
+        from .flax_utils import (
+            FlaxBeamSearchOutput,
+            FlaxGenerationMixin,
+            FlaxGreedySearchOutput,
+            FlaxSampleOutput,
+        )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

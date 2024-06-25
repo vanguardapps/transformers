@@ -167,3 +167,6 @@ tags
 
 # ruff
 .ruff_cache
+
+# TODO: ROY: Remove this before PR
+/db
