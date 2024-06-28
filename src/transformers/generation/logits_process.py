@@ -16,6 +16,7 @@
 import inspect
 import math
 import warnings
+from torch import nn
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
