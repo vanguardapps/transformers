@@ -686,28 +686,45 @@ class NLLBEmbeddingsModel(NLLBCheckpoint):
         batch.target_hidden_states = target_hidden_states.cpu()
 
 
+# GOAL USAGE
+
+
 def main():
     checkpoint = "facebook/nllb-200-distilled-600M"
     src_lang = "eng_Latn"
     tgt_lang = "deu_Latn"
     batch_size = 10
 
+    # TODO: ROY: Rewrite this! We want to support HF datsets so we will use load_dataset(csv) or whatnot!
     dataset_path = "data/de-en-emea-medical-clean.csv"
     dataset = KNNDataset(dataset_path)
     loader = DataLoader(dataset, batch_size=batch_size)
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-    model = NLLBEmbeddingsModel(
+    # NOTE: showing this construction for demonstration of desired under-the-hood functionality,
+    # but these parameters will be passed directly to the KNNStore as below
+    model = EmbeddingsModel(
         checkpoint=checkpoint,
-        src_lang=src_lang,
-        tgt_lang=tgt_lang,
+        src_lang=src_lang,  # should be able to use these if necessary, but not require them
+        tgt_lang=tgt_lang,  # (such as for models that just go from one source to one target)
     )
 
     knn_store = KNNStoreSQLite(
-        embedding_dim=model.config.hidden_size, database="db/test_db.db"
+        checkpoint=checkpoint,
+        src_lang=src_lang,
+        tgt_lang=tgt_lang,
+        # embedding_dim=model.config.hidden_size,    <--- THIS SHOULD BE INFERRED FROM checkpoint NOW
+        database="db/test_db.db",
     )
 
-    knn_store = KNNStoreSQLite(database="db/test_db.db")
+    # having initialized the store, we want to let them choose when to perform ingest like so
+    knn_store.ingest(dataset, run_id="some_identifier_for_the_run")
 
+    # ALSO note, we want the ingest to be resumable, thus the run_id to track and restore from using the DB
+
+    # TODO: ROY: REPLACE all of this with the one call to knn_store.ingest() above!!!
+    # The encapsulation should look professional. We may want to temper the OOP idea (though Python is steeped in OOP)
+    # and go with a more functional programming approach, perhaps still in OOP form, that applies actions to whole arrays / sets of data at once
     count = 0
     for english, german in (batches := tqdm(loader)):
         batches.set_description(f"Processing {dataset_path} in batches of {batch_size}")
@@ -723,8 +740,12 @@ def main():
 
     count += 1
 
+    # TODO: ROY: Make this resumable. We could also use a run_id here, but the DB is actually capable of describing
+    # whether or not all the source indices have been created for what is in the embedding table, so I think a more
+    # automated approach her is in order.
     knn_store.build_source_index()
 
+    # AFTER doing all of the above work, the below should "just work"
     model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint)
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint, src_lang=src_lang, tgt_lang=tgt_lang
