@@ -18,11 +18,20 @@ import copy
 import json
 import os
 import sqlite3
+import subprocess
 import torch
+import torch.nn as nn
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, is_dataclass
+from datasets import Value
 from itertools import islice
+from torch.utils.data import DataLoader
+from transformers import (
+    AutoConfig,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+)
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import faiss
@@ -1437,6 +1446,437 @@ class WatermarkingConfig:
             )
 
 
+def dict_subset(original, subset_keys):
+    """Generic utility to return a subset of an dict based on an array of keys.
+
+    Will not mutate `original`.
+    """
+    subset = {}
+    for key, value in original.items():
+        if key in subset_keys:
+            subset[key] = value
+    return subset
+
+
+# TODO: replace with `itertools.batched()` when we move to python >= 3.12
+# https://docs.python.org/3/library/itertools.html#itertools.batched
+def batched(iterable, batch_size):
+    if batch_size < 1:
+        raise ValueError('Please supply a `batch_size` greater than or equal to 1.')
+    iterator = iter(iterable)
+    while batch := tuple(islice(iterator, batch_size)):
+        yield batch
+
+
+class KNNStoreModelOutputs(object):
+    """Outputs of `KNNStoreModel.forward()`
+
+    Given:
+        b = batch size
+        k = current batch index
+
+        l_e = encoder sequence length including padding and special tokens
+        l_d = decoder sequence length including padding and special tokens
+
+        s_k = tokens in source sequence at batch index k
+        t_k = characters in target sequence at batch index k
+
+        d = model hidden size
+
+    Attributes:
+        source_ids_masked (list[LongTensor(s_k) x b]):
+        target_ids_masked (list[LongTensor(t_k) x b):
+        alignments (list[dict[int -> int] x b])
+        encoder_last_hidden_state (FloatTensor(b, l_e, d)),
+        target_hidden_states (FloatTensor(b, l_d, d)),
+        encoder_last_hidden_state_masked (list[FloatTensor(b, d)])
+        target_hidden_states_masked (list[FloatTensor(b, d)])
+    """
+
+    def __init__(
+        self,
+        source_ids_masked=None,
+        target_ids_masked=None,
+        alignments=None,
+        encoder_last_hidden_state=None,
+        target_hidden_states=None,
+        encoder_last_hidden_state_masked=None,
+        target_hidden_states_masked=None,
+    ):
+        self.source_ids_masked = source_ids_masked
+        self.target_ids_masked = target_ids_masked
+        self.alignments = alignments
+        self.encoder_last_hidden_state = encoder_last_hidden_state
+        self.target_hidden_states = target_hidden_states
+        self.encoder_last_hidden_state_masked = encoder_last_hidden_state_masked
+        self.target_hidden_states_masked = target_hidden_states_masked
+
+
+class KNNStoreModel(nn.Module):
+    """Helper class to produce outputs necessary for KNNSTore using model checkpoint.
+
+    Produces:
+        - Encoder embeddings (with special tokens removed)
+        - Autoregressive decoder embeddings (with special tokens removed)
+        - Token alignments (where decipherable)
+
+    Note: Requires encoder-decoder model.
+    """
+
+    # allowed HF parameters to `model.generate()`
+    HF_GENERATE_FUNCTION_PARAMS = ["logits_processor"]
+
+    # allowed HF parameters to `AutoModel.from_pretrained()`
+    HF_MODEL_FROM_PRETRAINED_PARAMS = [
+        "pretrained_model_name_or_path",
+        "model_args",
+        "config",
+        "state_dict",
+        "cache_dir",
+        "from_tf",
+        "force_download",
+        "resume_download",
+        "proxies",
+        "output_loading_info(bool,",
+        "local_files_only(bool,",
+        "revision",
+        "trust_remote_code",
+        "code_revision",
+        "token",
+    ]
+
+    # allowed HF parameters to `AutConfig.from_pretrained()`
+    HF_MODEL_CONFIG_PARAMS = [
+        "pretrained_model_name_or_path",
+        "cache_dir",
+        "force_download",
+        "resume_download",
+        "proxies",
+        "revision",
+        "return_unused_kwargs",
+        "trust_remote_code",
+        "name_or_path",
+        "output_hidden_states",
+        "output_attentions",
+        "return_dict",
+        "is_encoder_decoder",
+        "is_decoder",
+        "cross_attention_hidden_size",
+        "add_cross_attention",
+        "tie_encoder_decoder",
+        "prune_heads",
+        "chunk_size_feed_forward",
+        "max_length",
+        "min_length",
+        "do_sample",
+        "early_stopping",
+        "num_beams",
+        "num_beam_groups",
+        "diversity_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+        "typical_p",
+        "repetition_penalty",
+        "length_penalty",
+        "no_repeat_ngram_size",
+        "encoder_no_repeat_ngram_size",
+        "bad_words_ids",
+        "num_return_sequences",
+        "output_scores",
+        "return_dict_in_generate",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "remove_invalid_values",
+        "architectures",
+        "finetuning_task",
+        "id2label",
+        "label2id",
+        "num_labels",
+        "task_specific_params",
+        "problem_type",
+        "bos_token_id",
+        "pad_token_id",
+        "eos_token_id",
+        "decoder_start_token_id",
+        "sep_token_id",
+        "torchscript",
+        "tie_word_embeddings",
+        "torch_dtype",
+    ]
+
+    def __init__(self, checkpoint=None, use_cpu=False, **kwargs):
+        """Initialize the specialized KNN model with a checkpoint.
+
+        Args:
+            checkpoint:
+                Specifies the string checkpoint of the model to load. Either a HF
+                hub checkpoint or the path to the local model checkpoint directory.
+            use_cpu:
+                When true, tells the model to make the device 'cpu' even when a GPU is
+                available. When false, the model well always attempt to use any available
+                GPU(s) available in the runtime.
+            **kwargs:
+                Keyword arguments to be passed as necessary to the model and config
+                `from_pretrained` functions as appropriate.
+
+        """
+        super(KNNStoreModel, self).__init__()
+
+        if checkpoint is None or not isinstance(checkpoint, str):
+            raise ValueError(
+                "Please pass a string `checkpoint` to identify the model you wish to use from the hub or local."
+            )
+
+        self.checkpoint = checkpoint
+
+        model_kwargs = dict_subset(
+            kwargs, KNNStoreModel.HF_MODEL_FROM_PRETRAINED_PARAMS
+        )
+        model_config_kwargs = dict_subset(kwargs, KNNStoreModel.HF_MODEL_CONFIG_PARAMS)
+        self.generate_kwargs = dict_subset(
+            kwargs, KNNStoreModel.HF_GENERATE_FUNCTION_PARAMS
+        )
+        tokenizer_kwargs = dict_subset(kwargs, KNNStore.HF_TOKENIZER_PARAMS)
+
+        # KNN model always needs hidden states
+        model_config_kwargs['output_hidden_states'] = True
+        self.config = AutoConfig.from_pretrained(
+            self.checkpoint,
+            **model_config_kwargs,
+        )
+
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            self.checkpoint, config=self.config, **model_kwargs
+        )
+
+        self.custom_device = (
+            torch.device("cuda")
+            if torch.cuda.is_available() and (not use_cpu)
+            else "cpu"
+        )
+        self.model.to(self.custom_device)
+
+        # TODO: ROY: Test with and without the below, confirm useless, and remove if so
+        # freeze base model (not necessary as the primary forward() operation is run using torch.no_grad())
+        # for param in self.model.base_model.parameters():
+        #     param.requires_grad = False
+
+        # store tokenizer for computing special KNN outputs
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.checkpoint, **tokenizer_kwargs
+        )
+
+    def _collate(self, text_source, text_target):
+        """Collates input and target sequences using a tokenizer."""
+        source = self.tokenizer(
+            text_source,
+            padding=True,
+            return_special_tokens_mask=True,
+            return_tensors="pt",
+        )
+
+        target = self.tokenizer(
+            text_target=text_target,
+            padding=True,
+            return_special_tokens_mask=True,
+            return_tensors="pt",
+        )
+
+        return source, target
+
+    # TODO: ROY: Make `temp_filepath1` and `temp_filepath2` configurable as part of the `KNNStoreModel`
+    # class initialization
+    def _generate_alignments(
+        self,
+        source_ids_masked,
+        target_ids_masked,
+        temp_filepath1=None,
+        temp_filepath2=None,
+    ):
+        input_corpus_filepath = (
+            temp_filepath1
+            if temp_filepath1 is not None
+            else "fast_align_temp_file1.tmp"
+        )
+        output_alignments_filepath = (
+            temp_filepath2
+            if temp_filepath2 is not None
+            else "fast_align_temp_file2.tmp"
+        )
+
+        with open(input_corpus_filepath, "w") as corpus_file:
+            for source_ids, target_ids in zip(source_ids_masked, target_ids_masked):
+                line = (
+                    " ".join(self.tokenizer.convert_ids_to_tokens(source_ids))
+                    + " ||| "
+                    + " ".join(self.tokenizer.convert_ids_to_tokens(target_ids))
+                    + "\n"
+                )
+
+                corpus_file.write(line)
+
+        subprocess.run(
+            f"./bin/fast_align -i {input_corpus_filepath} -d -o -v > {output_alignments_filepath}",
+            shell=True,
+        )
+
+        with open(output_alignments_filepath) as alignments_file:
+            alignments = []
+            for line in alignments_file:
+                pairs = re.split(r"\s+", line)
+                line_alignments = {}
+
+                for pair in pairs:
+                    if not pair:
+                        continue
+
+                    split_pair = pair.split("-")
+                    source_index = split_pair[0]
+                    target_index = split_pair[1]
+
+                    # Accept first alignment only for given source token
+                    if not line_alignments.get(int(source_index), None):
+                        line_alignments[int(source_index)] = int(target_index)
+
+                alignments.append(line_alignments)
+
+        os.remove(input_corpus_filepath)
+        os.remove(output_alignments_filepath)
+
+        return alignments
+
+    def _postprocess(
+        self, source, target, encoder_last_hidden_state, target_hidden_states
+    ):
+        """Generates postprocessed version of batch data with special character tokens masked out.
+
+        Given:
+            l = source sequence length
+            m = target sequence length
+            e = model embedding dimension
+
+        Returns the following properties (m = particular sequence length):
+            source_ids_masked                   (list[LongTensor(l)])
+            target_ids_masked                   (list[LongTensor(m)])
+            encoder_last_hidden_state_masked   (list[FloatTensor(m, e)])
+            target_hidden_states_masked        (list[FloatTensor(m, e)])
+        """
+
+        source_ids_masked = []
+        target_ids_masked = []
+        encoder_last_hidden_state_masked = []
+        target_hidden_states_masked = []
+
+        for (
+            source_ids,
+            source_mask,
+            target_ids,
+            target_mask,
+            encoder_hidden_state,
+            target_hidden_state,
+        ) in zip(
+            source.input_ids,
+            source.special_tokens_mask,
+            target.input_ids,
+            target.special_tokens_mask,
+            encoder_last_hidden_state,
+            target_hidden_states,
+        ):
+            source_mask = np.invert(np.array(source_mask, dtype=bool))
+            target_mask = np.invert(np.array(target_mask, dtype=bool))
+            source_ids_masked.append(torch.LongTensor(source_ids[source_mask]))
+            target_ids_masked.append(torch.LongTensor(target_ids[target_mask]))
+            encoder_last_hidden_state_masked.append(
+                torch.FloatTensor(encoder_hidden_state[source_mask])
+            )
+            target_hidden_states_masked.append(
+                torch.FloatTensor(target_hidden_state[target_mask])
+            )
+
+        alignments = self._generate_alignments(source_ids_masked, target_ids_masked)
+
+        return (
+            source_ids_masked,
+            target_ids_masked,
+            encoder_last_hidden_state_masked,
+            target_hidden_states_masked,
+            alignments,
+        )
+
+    def forward(self, text_source, text_target):
+        source, target = self._collate(text_source, text_target)
+
+        batch_source_ids = source.input_ids.to(self.custom_device)
+        batch_source_attention_mask = source.attention_mask.to(self.custom_device)
+        batch_target_ids = target.input_ids.to(self.custom_device)
+
+        batch_size = source.input_ids.size(0)
+
+        target_hidden_states = torch.empty(
+            (batch_size, 0, self.config.hidden_size), dtype=torch.float32
+        ).to(self.custom_device)
+
+        target_id_count = target.input_ids.size(1)
+
+        self.model.eval()
+
+        with torch.no_grad():
+            for index in range(1, target_id_count + 1):
+                # Forward pass model
+                model_outputs = self.model(
+                    input_ids=batch_source_ids,
+                    attention_mask=batch_source_attention_mask,
+                    decoder_input_ids=batch_target_ids[:, :index].to(
+                        self.custom_device
+                    ),
+                )
+
+                # Get all of the encoder representations on the first pass
+                if index == 1:
+                    encoder_last_hidden_state = (
+                        model_outputs.encoder_last_hidden_state.detach()
+                    )
+
+                # Get index of token currently being decoded
+                token_rep_idx = index - 1
+
+                # Get decoder representation
+                # .detach() not necessary but illustrates intent (would still work without torch.no_grad())
+                last_hidden_state = model_outputs.decoder_hidden_states[-1].detach()
+                token_representation = last_hidden_state[:, np.newaxis, token_rep_idx]
+
+                # Concatenate decoder last hidden state of current token
+                target_hidden_states = torch.cat(
+                    (target_hidden_states, token_representation), dim=1
+                )
+
+        encoder_last_hidden_state = encoder_last_hidden_state.cpu()
+        target_hidden_states = target_hidden_states.cpu()
+
+        (
+            source_ids_masked,
+            target_ids_masked,
+            encoder_last_hidden_state_masked,
+            target_hidden_states_masked,
+            alignments,
+        ) = self._postprocess(
+            source, target, encoder_last_hidden_state, target_hidden_states
+        )
+
+        knn_outputs = KNNStoreModelOutputs(
+            encoder_last_hidden_state=encoder_last_hidden_state,
+            target_hidden_states=target_hidden_states,
+            source_ids_masked=source_ids_masked,
+            target_ids_masked=target_ids_masked,
+            encoder_last_hidden_state_masked=encoder_last_hidden_state_masked,
+            target_hidden_states_masked=target_hidden_states_masked,
+            alignments=alignments,
+        )
+
+        return knn_outputs
+
+
 @dataclass
 class KNNStore(ABC):
     """KNN-MT embeddings store abstract class.
@@ -1456,7 +1896,6 @@ class KNNStore(ABC):
         configuration_table_stem (str):
         embedding_table_stem (str):
         faiss_cache_table_stem (str):
-        target_build_table_stem (str):
         configuration_table_name (str):
         embedding_table_name (str):
         faiss_cache_table_name (str):
@@ -1476,8 +1915,42 @@ class KNNStore(ABC):
     default_embedding_dtype = "float32"
     default_c = 5
 
+    # allowed HF parameters to `AutoTokenizer.from_pretrained()`
+    HF_TOKENIZER_PARAMS = [
+        "pretrained_model_name_or_path",
+        "model_max_length",
+        "padding_side",
+        "truncation_side",
+        "chat_template",
+        "model_input_names",
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "sep_token",
+        "pad_token",
+        "cls_token",
+        "mask_token",
+        "additional_special_tokens",
+        "clean_up_tokenization_spaces",
+        "split_special_tokens",
+        "inputs",
+        "config",
+        "cache_dir",
+        "force_download",
+        "resume_download",
+        "proxies",
+        "revision",
+        "subfolder",
+        "use_fast",
+        "tokenizer_type",
+        "trust_remote_code",
+        "src_lang",
+        "tgt_lang",
+    ]
+
     def __init__(
         self,
+        checkpoint=None,
         embedding_dim=None,
         table_prefix=None,
         configuration_table_stem=None,
@@ -1507,7 +1980,13 @@ class KNNStore(ABC):
             **kwargs (dict):
 
         """
-        self.embedding_dim = embedding_dim
+        self.checkpoint = checkpoint
+
+        if embedding_dim is None:
+            temporary_config = AutoConfig.from_pretrained(checkpoint)
+            self.embedding_dim = temporary_config.hidden_size
+        else:
+            self.embedding_dim = embedding_dim
 
         self.table_prefix = (
             table_prefix if table_prefix is not None else KNNStore.default_table_prefix
@@ -1558,10 +2037,10 @@ class KNNStore(ABC):
         self.faiss_cache_table_name = (
             self.table_prefix + "_" + self.faiss_cache_table_stem
         )
-
         self._reset_source_token_embeddings_offset()
 
-        self._initialize_database(**kwargs)
+        self.kwargs = kwargs if kwargs is not None else {}
+        self._initialize_database()
 
     @staticmethod
     def _batched(iterable, n):
@@ -1576,29 +2055,87 @@ class KNNStore(ABC):
         serialized_index = faiss.serialize_index(faiss_index)
         return serialized_index.tobytes()
 
-    # TODO: Provide KNN batch that does aligning using fast_align. This is going to be kind of a
-    # rough spot in the implementation. Makes me want to get back into C++ and learn fast_align
-    # from scratch, make a python port of it or something. That would be a real selling point
-    # for this module though, as very few people can say they have a sentence aligner in
-    # code (I'm actually not sure I should look and see if someone has done this).
-
     #
     # Methods provided as part of base class
     #
 
-    def ingest(self, knn_batch):
+    @staticmethod
+    def _raise_error(type, *args):
+        if type == 'missing-required-param':
+            raise ValueError(
+                f"Missing required parameter `{args[0]}` to function `{args[1]}`."
+                + (" " + args[2] if len(args) > 2 else "")
+            )
+        if type == 'dataset-column-type':
+            raise ValueError(
+                f"Please provide a {args[0]} column of with dtype='string'. This feature is intended "
+                "for use with translation from a source to a target string representation, and "
+                "so the dtype 'string' is required on dataset columns used with `KNNStore`."
+            )
+        if type == 'dataset-feature-type':
+            raise ValueError(
+                f"The feature `{args[0]}` is not of type `Value`. Please only use features of type `Value` "
+                "when passing datasets to the `KNNStore` for ingestion."
+            )
+
+    @staticmethod
+    def _validate_ingest_params(dataset, src_col, tgt_col, batch_size):
+        if src_col is None or not isinstance(src_col, str):
+            KNNStore._raise_error(
+                'missing-required-param',
+                'src_col',
+                'ingest',
+                "Name of the `Feature` column in `dataset` with source-side translation text. Must be of type `str`.",
+            )
+        if tgt_col is None or not isinstance(tgt_col, str):
+            KNNStore._raise_error(
+                'missing-required-param',
+                'tgt_col',
+                'ingest',
+                "Name of the `Feature` column in `dataset` with target-side translation text. Must be of type `str`.",
+            )
+        if batch_size is None or not isinstance(batch_size, int) or batch_size < 1:
+            KNNStore._raise_error(
+                'missing-required-param',
+                'batch_size',
+                'ingest',
+                "Batch size is required for `KNNStore.ingest`. Must be a postive integer.",
+            )
+        if not isinstance(dataset.features[src_col], Value):
+            KNNStore._raise_error('dataset-feature-type', src_col)
+        if not isinstance(dataset.features[tgt_col], Value):
+            KNNStore._raise_error('dataset-feature-type', tgt_col)
+        if dataset.features[src_col].dtype != 'string':
+            KNNStore._raise_error('dataset-column-type', 'source')
+        if dataset.features[src_col].dtype != 'string':
+            KNNStore._raise_error('dataset-column-type', 'target')
+        if not hasattr(dataset, '_fingerprint'):
+            raise ValueError(
+                "Please provide a dataset using the Hugging Face datasets library. All such datasets "
+                "are automatically given an attribute Dataset._fingerprint for use in caching, and the "
+                "same fingerprint is used here to cache ingestion and indexing runs so they may be "
+                "resumed at a later time after stopping."
+            )
+
+    def _ingest_batch(self, batch, cache_key):
+        """TODO: ROY: finish docstring
+
+        Note: Source tokens without a corresponding entry in `alignments` property of input batch
+              to `KNNStore.ingest(input_batch)` (in other words, source tokens that were not able to be
+              aligned to target tokens) will be ignored and their related embeddings will not be stored.
+        """
         for (
             source_token_ids,
-            target_ids,
+            target_token_ids,
             alignments,
             source_embeddings,
             target_embeddings,
         ) in zip(
-            knn_batch.input_ids_masked,
-            knn_batch.label_ids_masked,
-            knn_batch.alignments,
-            knn_batch.encoder_last_hidden_state_masked,
-            knn_batch.target_hidden_states_masked,
+            batch.source_ids_masked,
+            batch.target_ids_masked,
+            batch.alignments,
+            batch.encoder_last_hidden_state_masked,
+            batch.target_hidden_states_masked,
         ):
             for source_index, source_token_id in enumerate(source_token_ids):
                 target_index = alignments.get(source_index, None)
@@ -1606,7 +2143,7 @@ class KNNStore(ABC):
                 # Ignore any source token that was not aligned to a target token
                 if target_index:
                     source_token_id = source_token_id
-                    target_token_id = target_ids[target_index]
+                    target_token_id = target_token_ids[target_index]
                     source_embedding = source_embeddings[source_index]
                     target_embedding = target_embeddings[target_index]
                     source_embedding_bytestring = source_embedding.numpy().tobytes()
@@ -1616,7 +2153,72 @@ class KNNStore(ABC):
                         target_token_id=target_token_id.item(),
                         source_embedding_bytestring=source_embedding_bytestring,
                         target_embedding_bytestring=target_embedding_bytestring,
+                        cache_key=cache_key,
                     )
+
+    def truncate_artifacts(self, fingerprint=None, remove_all=None):
+        if fingerprint is not None:
+            self._truncate_artifacts(fingerprint)
+        elif remove_all == True:
+            self._truncate_all_artifacts()
+        else:
+            warnings.warn(
+                "No artifacts were truncated because `fingerprint` was not specified and "
+                "`remove_all` was not explicity set to `True`."
+            )
+
+    def ingest(
+        self,
+        dataset,
+        src_col=None,
+        tgt_col=None,
+        batch_size=None,
+        force_fingerprint=None,
+        progress_bar=None,
+    ):
+        KNNStore._validate_ingest_params(dataset, src_col, tgt_col, batch_size)
+
+        progress_bar = progress_bar if progress_bar is not None else False
+
+        if not hasattr(self, 'model'):
+            self.knn_model = KNNStoreModel(checkpoint=self.checkpoint, **self.kwargs)
+
+        # fingerprint is built-in HF dataset fingerprint plus columns specified
+        fingerprint = (
+            dataset._fingerprint + src_col + tgt_col
+            if force_fingerprint is None
+            else force_fingerprint
+        )
+
+        timestep_count = self._count_cache_key_timesteps(cache_key=fingerprint)
+
+        if timestep_count > 0:
+            print(f"Resuming from timestep_count {timestep_count}.")
+        else:
+            print("Starting ingest on new dataset.")
+
+        dataset = dataset.select([i for i in range(timestep_count, len(dataset))])
+
+        print(f"{len(dataset)} rows remaining to be processed in dataset.")
+        print(f"Using batches of {batch_size}.")
+
+        loader = DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        if progress_bar:
+            loader = tqdm(loader)
+
+        for batch in loader:
+            text_source = batch[src_col]
+            text_target = batch[tgt_col]
+            outputs = self.knn_model(text_source, text_target)
+            self._ingest_batch(batch=outputs, cache_key=fingerprint)
+
+        # TODO: ROY: Capture process / keyboard interrupt and return this no matter what
+        return fingerprint
 
     def _get_new_faiss_index(self):
         return faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dim))
@@ -1687,28 +2289,35 @@ class KNNStore(ABC):
         faiss.normalize_L2(batch_embeddings_np)
         faiss_index.add_with_ids(batch_embeddings_np, batch_ids_np)
 
-    def build_source_index(self):
-        faiss_index = self._get_new_faiss_index()
-        source_token_ids = self._retrieve_all_source_token_ids()
+    def build_source_index(self, progress_bar=None):
+        source_token_ids = self._retrieve_unindexed_source_token_ids()
 
-        # One source token ID at a time
-        for (source_token_id,) in (batches := tqdm(source_token_ids)):
-            batches.set_description(
-                f"Building index for source token ID {source_token_id}"
-            )
+        progress_bar = progress_bar if progress_bar is not None else False
 
+        if progress_bar:
+            source_token_ids = tqdm(source_token_ids)
+
+        for source_token_id in source_token_ids:
             embedding_batches = self._retrieve_source_token_embeddings_batches(
                 source_token_id
             )
+
+            faiss_index = self.get_source_token_faiss_index(source_token_id)
+
+            if faiss_index is None:
+                faiss_index = self._get_new_faiss_index()
+
+            ids_added = []
 
             while rows := next(embedding_batches):
                 batch_ids, batch_bytestrings = zip(*rows)
                 self._add_bytestrings_to_faiss_index(
                     faiss_index, batch_ids, batch_bytestrings
                 )
+                ids_added += batch_ids
 
             bytestring = KNNStore._convert_faiss_index_to_bytestring(faiss_index)
-            self._store_source_faiss_bytestring(source_token_id, bytestring)
+            self._store_source_faiss_bytestring(source_token_id, bytestring, ids_added)
             faiss_index.reset()
 
     def get_source_token_faiss_index(self, source_token_id):
@@ -1716,20 +2325,6 @@ class KNNStore(ABC):
         if bytestring is not None:
             return faiss.deserialize_index(np.frombuffer(bytestring, dtype=np.uint8))
         return None
-
-    def knn_source_faiss_index(self, source_token_id, source_embedding, k):
-        faiss_index = self.get_source_token_faiss_index(source_token_id)
-
-        # TODO: Write the faiss stuff to perform the k nearest neighbor search here
-        # and return the list of ids
-
-    def knn_get_logits(self):
-        # TODO: Figure out how this all comes together. Need to review math. It's something like
-        # calling knn_source_faiss_index() above and then calling build_target_faiss_index(), then
-        # searching that index with the target and getting the top k matching target tokens, then
-        # going to the math to interpolate with existing model. that will be another class that
-        # composes this probably, KNNOperator or something.
-        return True
 
     def build_target_datastore(
         self,
@@ -1857,13 +2452,13 @@ class KNNStore(ABC):
             return batch_l2_distances, batch_target_token_ids
 
         if vocab_dim is None:
-            raise ValueError(
-                "Missing required parameter `vocab_dim` necessary for calculating logits."
+            KNNStore._raise_error(
+                "missing-required-param", "vocab_dim", "search_target_datastore"
             )
 
         if temperature is None:
-            raise ValueError(
-                "Missing required parameter `temperature` necessary for calculating logits."
+            KNNStore._raise_error(
+                "missing-required-param", "temperature", "search_target_datastore"
             )
 
         batch_size = batch_l2_distances.shape[0]
@@ -1882,13 +2477,10 @@ class KNNStore(ABC):
                     else 0
                 )
 
-        # TODO: ROY: Investigate whether it would work to strip away the np.exp( part here
-        # and just return scores (I don't think so--normalization of values would be weird)
-
         # shape (batch_size, k)
         exp_term = np.exp(-batch_l2_distances / temperature)
 
-        # Replace any infinitesimal or zero values in `exp_term` with epsilon
+        # replace any infinitesimal or zero values in `exp_term` with epsilon
         epsilon = 1e-7
         exp_term[exp_term < epsilon] = epsilon
 
@@ -1921,7 +2513,7 @@ class KNNStore(ABC):
             and hasattr(self, "c")
         ):
             raise ValueError(
-                "Please sure the KNNStore instance is valid and properly constructed."
+                "Please sure the `KNNStore` instance is valid and properly constructed."
             )
 
     #
@@ -1933,11 +2525,12 @@ class KNNStore(ABC):
         """Initialize DB. This is an abstract method.
 
         This function initializes the DB with the tables required for the KNN store to run. This
-        includes four tables:
+        includes the following tables:
 
         - Table 1: Configuration
         - Table 2: Timesteps. Source and target token IDs and embeddings per timestep
         - Table 3: Faiss indices storing encoder embeddings across each source token ID
+        - Table 4: Run cache for caching ingestion and indexing attempts to resume later
 
         Table 1: Configuration key/value pairs
             >Default table name is `knn_store_config`
@@ -1975,6 +2568,15 @@ class KNNStore(ABC):
                 position in the corpus, taking into account the whole source, and all target
                 tokens up to the point t in the sequence.
 
+            - cache_key:
+                String data representing a unique run or attempt, usually tied to the dataset
+                being processed such that a different cache_key implies that a new or modified
+                dataset is being attempted.
+
+            - is_indexed:
+                Boolean representing whether the given timestep has been included in a source
+                faiss index in Table 3.
+
 
         Table 3: Faiss indices storing encoder embeddings across each source token ID
             >Default table name is `knn_store_faiss_index`
@@ -1985,13 +2587,8 @@ class KNNStore(ABC):
             - faiss_index:
                 The byte data for a serialized FAISS index using `faiss.serialize_index(index)`.
 
-
         Note: Each of these tables must be implemented according to the type of database chosen
               for the subclass.
-
-        Note: Source tokens without a corresponding entry in `alignments` property of input batch
-              to `KNNStore.ingest(input_batch)` (in other words, source tokens that were not able to be
-              aligned to target tokens) will be ignored and their related embeddings will not be stored.
 
         Note: No database implementation is given. Use one of the subclasses for a particular
         type of database.
@@ -2013,6 +2610,7 @@ class KNNStore(ABC):
         target_token_id,
         source_embedding_bytestring,
         target_embedding_bytestring,
+        cache_key,
     ):
         """Store source and target token IDs and embeddings for single timestep. This is an abstract method.
 
@@ -2021,13 +2619,15 @@ class KNNStore(ABC):
             target_token_id (int):
             source_embedding_bytestring (bytes):
             target_embedding_bytestring (bytes):
+            cache_key (str):
 
         Stores the following in Table 2 in the DB:
 
         source_token_id (int),
         target_token_id (int),
         source_embedding (blob/bytea),
-        target_embedding (blob/bytea)
+        target_embedding (blob/bytea),
+        cache_key (text)
 
         Table 2: Source and target token IDs and embeddings per timestep
 
@@ -2039,10 +2639,10 @@ class KNNStore(ABC):
         )
 
     @abstractmethod
-    def _retrieve_all_source_token_ids(self):
-        """Retrieve all source token IDs from Table 2. This is an abstract method.
+    def _retrieve_unindexed_source_token_ids(self):
+        """Retrieve source token IDs for rows in Table 2 that are not indexed in Table 3.
 
-        Retrieves `source_token_id` across all rows in Table 2 in the DB.
+        Retrieves `source_token_id` across all rows in Table 2 that are not indexed in Table 3.
 
         Table 2: Source and target token IDs and embeddings per timestep
 
@@ -2053,7 +2653,7 @@ class KNNStore(ABC):
             tuple(int): All source token IDs stored in Table 2.
         """
         raise NotImplementedError(
-            "Make sure to implement `_retrieve_all_source_token_ids` in a subclass."
+            "Make sure to implement `_retrieve_unindexed_source_token_ids` in a subclass."
         )
 
     @abstractmethod
@@ -2087,7 +2687,7 @@ class KNNStore(ABC):
         )
 
     @abstractmethod
-    def _store_source_faiss_bytestring(self, source_token_id, bytestring):
+    def _store_source_faiss_bytestring(self, source_token_id, bytestring, ids_added):
         """Stores faiss index for source embeddings across one source token ID. This is an abstract method.
 
         Stores the faiss index represented in the `bytestring` parameter in Table 3, overwriting any
@@ -2102,6 +2702,8 @@ class KNNStore(ABC):
                 Source token ID for this source embedding index.
             bytestring (bytes):
                 Bytes that make up the serialized version of the faiss index for this source token ID
+            ids_added (tuple(int)):
+                Table 2 IDs (timesteps) that are being added as part of persisting this bytestring.
         """
         raise NotImplementedError(
             "Make sure to implement `_store_source_faiss_bytestring` in a subclass."
@@ -2149,7 +2751,7 @@ class KNNStore(ABC):
                 Table 2 row IDs for which to retrieve the `target_embedding` values.
 
         Returns:
-            tuple(tuple(int, bytes)): A tuple of two-element tuples, each containing the timestep /
+            list[tuple(int, bytes)]: A tuple of two-element tuples, each containing the timestep /
             embedding ID and the bytestring of the faiss index respectively.
         """
         raise NotImplementedError(
@@ -2179,6 +2781,48 @@ class KNNStore(ABC):
         """
         raise NotImplementedError(
             "Make sure to implement `_retrieve_target_token_ids` in a subclass."
+        )
+
+    @abstractmethod
+    def _truncate_artifacts(self, cache_key):
+        """Removes artifacts according to their `cache_key`.
+
+        TODO: ROY: Finish this docstring
+
+        Args:
+            fingerprint (str):
+
+        Returns:
+            int: Number of corpus timesteps removed
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_truncate_artifacts` in a subclass."
+        )
+
+    @abstractmethod
+    def _truncate_all_artifacts(self):
+        """Removes all artifacts, leaving only core configurations.
+
+        TODO: ROY: Finish this docstring
+
+        Returns:
+            int: Number of corpus timesteps removed
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_truncate_all_artifacts` in a subclass."
+        )
+
+    @abstractmethod
+    def _count_cache_key_timesteps(self, cache_key):
+        """Query Table 3 for how many rows have a particular `cache_key`.
+
+        TODO: ROY: Finish this docstring
+
+        Returns:
+            int: The number of timestep rows associated with the given `cache_key`.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_count_cache_key_timesteps` in a subclass."
         )
 
     class __FaissQueries__(dict):
@@ -2287,12 +2931,11 @@ class KNNStore(ABC):
             """
             k = k if k is not None else self.k
 
-            # use_gpu = use_gpu if use_gpu is not None else False
-
             # TODO: ROY: `faiss-gpu` package is unreliable for newer CUDA versions. Need to use the
             # wheel, but that means figuring out a place to store the wheel and how to integrate it
             # into the Hugging Face setup script. For now, run faiss on CPU and complete testing
-            # and debugging, face this problem last.
+            # and debugging, face this problem last:
+            # use_gpu = use_gpu if use_gpu is not None else False
             use_gpu = False
 
             if use_gpu:
@@ -2312,28 +2955,6 @@ class KNNStore(ABC):
             return distance, ids
 
 
-# Allowed kwargs passed to `sqlite.connect()`
-SQLITE_CONNECT_KWARGS = [
-    "cached_statements",
-    "check_same_thread",
-    "database",
-    "detect_types",
-    "factory",
-    "isolation_level",
-    "timeout",
-    "uri",
-]
-
-
-def extract_key_value_pairs_from_dict(original_dict, subset_keys):
-    subset = {}
-    keys = [key for key in original_dict.keys()]
-    for key in keys:
-        if key in subset_keys and original_dict.get(key, None) is not None:
-            subset[key] = original_dict.pop(key)
-    return subset
-
-
 @dataclass
 class KNNStoreSQLite(KNNStore):
     """KNN-MT embeddings store for SQLite.
@@ -2345,8 +2966,21 @@ class KNNStoreSQLite(KNNStore):
 
     schema = "public"
 
+    # allowed kwargs passed to `sqlite.connect()`
+    SQLITE_CONNECT_KWARGS = [
+        "cached_statements",
+        "check_same_thread",
+        "database",
+        "detect_types",
+        "factory",
+        "isolation_level",
+        "timeout",
+        "uri",
+    ]
+
     def __init__(
         self,
+        checkpoint=None,
         embedding_dim=None,
         table_prefix=None,
         configuration_table_stem=None,
@@ -2382,8 +3016,8 @@ class KNNStoreSQLite(KNNStore):
             **kwargs (dict):
         """
 
-        self.sqlite_connect_kwargs = extract_key_value_pairs_from_dict(
-            kwargs, SQLITE_CONNECT_KWARGS
+        self.sqlite_connect_kwargs = dict_subset(
+            kwargs, KNNStoreSQLite.SQLITE_CONNECT_KWARGS
         )
 
         if len(self.sqlite_connect_kwargs) < 1:
@@ -2392,6 +3026,7 @@ class KNNStoreSQLite(KNNStore):
             )
 
         super(KNNStoreSQLite, self).__init__(
+            checkpoint=checkpoint,
             embedding_dim=embedding_dim,
             table_prefix=table_prefix,
             configuration_table_stem=configuration_table_stem,
@@ -2401,6 +3036,7 @@ class KNNStoreSQLite(KNNStore):
             target_batch_size=target_batch_size,
             embedding_dtype=embedding_dtype,
             c=c,
+            **kwargs,
         )
 
     @staticmethod
@@ -2457,13 +3093,18 @@ class KNNStoreSQLite(KNNStore):
 
         for name, value in rows:
             if value != "None":
-                if name == "embedding_dtype":
+                if name == "checkpoint":
+                    self.checkpoint = value
+                elif name == "embedding_dtype":
                     self.embedding_dtype = value
                 elif name == "embedding_dim":
                     self.embedding_dim = int(value)
 
+        if self.checkpoint is None:
+            KNNStore._raise_error("missing-required-param", "checkpoint", "__init__")
+
         if self.embedding_dim is None:
-            raise ValueError("Missing required parameter `embedding_dim`.")
+            KNNStore._raise_error("missing-required-param", "embedding_dim", "__init__")
 
         print(f"Upserting configurations in '{valid_configuration_table_name}'")
         upsert_embedding_dtype_query = (
@@ -2500,7 +3141,9 @@ class KNNStoreSQLite(KNNStore):
             "    source_token_id integer, "
             "    target_token_id integer, "
             "    source_embedding blob, "
-            "    target_embedding blob "
+            "    target_embedding blob, "
+            "    cache_key text, "
+            "    is_indexed bool default false "
             ");"
         )
         cur.execute(create_embedding_table_query)
@@ -2531,8 +3174,9 @@ class KNNStoreSQLite(KNNStore):
         target_token_id,
         source_embedding_bytestring,
         target_embedding_bytestring,
+        cache_key,
     ):
-        valid_embedding_table_name = self._validate_table_name(
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
 
@@ -2540,8 +3184,8 @@ class KNNStoreSQLite(KNNStore):
         cur = con.cursor()
 
         insert_embedding_query = (
-            f"insert into {valid_embedding_table_name} (source_token_id, target_token_id, source_embedding, target_embedding) "
-            "values (?, ?, ?, ?);"
+            f"insert into {valid_embedding_table_name} (source_token_id, target_token_id, source_embedding, target_embedding, cache_key) "
+            "values (?, ?, ?, ?, ?);"
         )
 
         cur.execute(
@@ -2551,6 +3195,7 @@ class KNNStoreSQLite(KNNStore):
                 target_token_id,
                 source_embedding_bytestring,
                 target_embedding_bytestring,
+                cache_key,
             ),
         )
         con.commit()
@@ -2558,20 +3203,20 @@ class KNNStoreSQLite(KNNStore):
         cur.close()
         con.close()
 
-    def _retrieve_all_source_token_ids(self):
-        valid_embedding_table_name = self._validate_table_name(
+    def _retrieve_unindexed_source_token_ids(self):
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
 
         con = self._get_sqlite_connection()
         cur = con.cursor()
 
-        # Get unique source token IDs to iterate over
         cur.execute(
-            f"select distinct source_token_id from {valid_embedding_table_name};"
+            f"select distinct source_token_id from {valid_embedding_table_name} where is_indexed = false;"
         )
 
-        source_token_ids = cur.fetchall()
+        rows = cur.fetchall()
+        source_token_ids = tuple(row[0] for row in rows)
 
         cur.close()
         con.close()
@@ -2579,7 +3224,7 @@ class KNNStoreSQLite(KNNStore):
         return source_token_ids
 
     def _retrieve_source_token_embeddings_batches(self, source_token_id):
-        valid_embedding_table_name = self._validate_table_name(
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
 
@@ -2588,7 +3233,12 @@ class KNNStoreSQLite(KNNStore):
 
         self._reset_source_token_embeddings_offset()
 
-        while self._embedding_table_offset == 0 or len(rows) > 0:
+        first_iter = True
+
+        # source_token_id = 18498
+        while first_iter or len(rows) > 0:
+            first_iter = False
+
             valid_embedding_table_offset, valid_embedding_batch_size = (
                 self._get_valid_embedding_offset_and_batch_size()
             )
@@ -2596,7 +3246,7 @@ class KNNStoreSQLite(KNNStore):
             source_embedding_query = (
                 "select id, source_embedding "
                 f"from {valid_embedding_table_name} "
-                "where source_token_id = ? and target_token_id is not null "
+                "where source_token_id = ? and target_token_id is not null and is_indexed is false "
                 "order by id "
                 f"limit {valid_embedding_batch_size} "
                 f"offset {valid_embedding_table_offset};"
@@ -2604,17 +3254,22 @@ class KNNStoreSQLite(KNNStore):
 
             cur.execute(
                 source_embedding_query,
-                (source_token_id,),
+                (int(source_token_id),),
             )
+
             rows = cur.fetchall()
             self._increment_source_token_embeddings_offset()
+
             yield rows
 
         cur.close()
         con.close()
 
-    def _store_source_faiss_bytestring(self, source_token_id, bytestring):
-        valid_faiss_cache_table_name = self._validate_table_name(
+    def _store_source_faiss_bytestring(self, source_token_id, bytestring, ids_added):
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+        valid_faiss_cache_table_name = KNNStoreSQLite._validate_table_name(
             self.faiss_cache_table_name
         )
 
@@ -2632,13 +3287,23 @@ class KNNStoreSQLite(KNNStore):
                 bytestring,
             ),
         )
+
+        # process in batches of 1000 due to SQLite limit of 32766 placeholders in one statement
+        # see "9. Maximum Number of Host Parameters In A Single SQL Statement": https://www.sqlite.org/limits.html
+        for batch_ids in batched(ids_added, 1000):
+            placeholders = len(batch_ids) * "?"
+            cur.execute(
+                f"update {valid_embedding_table_name} set is_indexed = true where id in ({','.join(placeholders)});",
+                batch_ids,
+            )
+
         con.commit()
 
         cur.close()
         con.close()
 
     def _retrieve_source_faiss_bytestring(self, source_token_id):
-        valid_faiss_cache_table_name = self._validate_table_name(
+        valid_faiss_cache_table_name = KNNStoreSQLite._validate_table_name(
             self.faiss_cache_table_name
         )
 
@@ -2663,20 +3328,23 @@ class KNNStoreSQLite(KNNStore):
         return bytestring
 
     def _retrieve_target_bytestrings(self, embedding_ids):
-        valid_embedding_table_name = self._validate_table_name(
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
 
         con = self._get_sqlite_connection()
         cur = con.cursor()
 
-        placeholders = len(embedding_ids) * "?"
-
-        cur.execute(
-            f"select id, target_embedding from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
-            embedding_ids,
-        )
-        rows = cur.fetchall()
+        # process in batches of 1000 due to SQLite limit of 32766 placeholders in one statement
+        # see "9. Maximum Number of Host Parameters In A Single SQL Statement": https://www.sqlite.org/limits.html
+        rows = []
+        for batch_ids in batched(embedding_ids, 1000):
+            placeholders = len(batch_ids) * "?"
+            cur.execute(
+                f"select id, target_embedding from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
+                batch_ids,
+            )
+            rows += cur.fetchall()
 
         cur.close()
         con.close()
@@ -2684,7 +3352,6 @@ class KNNStoreSQLite(KNNStore):
         return rows
 
     def _retrieve_target_token_ids(self, embedding_ids):
-        # TODO: ROY: Finish docstring
         embedding_ids_len = (
             len(embedding_ids) if isinstance(embedding_ids, tuple) else 0
         )
@@ -2692,7 +3359,7 @@ class KNNStoreSQLite(KNNStore):
         if embedding_ids_len < 1:
             return ()
 
-        valid_embedding_table_name = self._validate_table_name(
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
 
@@ -2700,14 +3367,18 @@ class KNNStoreSQLite(KNNStore):
         cur = con.cursor()
 
         unique_embedding_ids = tuple(set(embedding_ids))
-        placeholders = len(unique_embedding_ids) * "?"
 
-        cur.execute(
-            f"select id, target_token_id from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
-            tuple(int(embedding_id) for embedding_id in unique_embedding_ids),
-        )
-
-        rows = cur.fetchall()
+        # process in batches of 1000 due to SQLite limit of 32766 placeholders in one statement
+        # see "9. Maximum Number of Host Parameters In A Single SQL Statement": https://www.sqlite.org/limits.html
+        rows = []
+        for batch_ids in batched(unique_embedding_ids, 1000):
+            placeholders = len(unique_embedding_ids) * "?"
+            batch_ids = tuple(int(id) for id in batch_ids)
+            cur.execute(
+                f"select id, target_token_id from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
+                batch_ids,
+            )
+            rows += cur.fetchall()
 
         target_token_dict = {
             embedding_id: target_token_id for (embedding_id, target_token_id) in rows
@@ -2721,6 +3392,96 @@ class KNNStoreSQLite(KNNStore):
         con.close()
 
         return target_token_ids
+
+    def _truncate_artifacts(self, cache_key):
+        """Removes artifacts according to their cache_key.
+
+        TODO: ROY: Finish this docstring
+
+        Args:
+            cache_key (str):
+
+        Returns:
+            int: Number of corpus timesteps removed
+        """
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+        valid_faiss_cache_table_name = KNNStoreSQLite._validate_table_name(
+            self.faiss_cache_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        cur.execute(
+            f"delete from {valid_faiss_cache_table_name} f where f.source_token_id in "
+            f"(select e.source_token_id from {valid_embedding_table_name} e where e.cache_key = ?);",
+            (cache_key,),
+        )
+
+        cur.execute(
+            f"delete from {valid_embedding_table_name} where e.cache_key = ?;",
+            (cache_key,),
+        )
+
+        con.commit()
+
+        cur.close()
+        con.close()
+
+    def _truncate_all_artifacts(self):
+        """Removes all artifacts, leaving only core configurations.
+
+        TODO: ROY: Finish this docstring
+
+        Returns:
+            int: Number of corpus timesteps removed
+        """
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+        valid_faiss_cache_table_name = KNNStoreSQLite._validate_table_name(
+            self.faiss_cache_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        cur.execute(f"delete from {valid_faiss_cache_table_name};")
+        cur.execute(f"delete from {valid_embedding_table_name};")
+
+        con.commit()
+
+        cur.close()
+        con.close()
+
+    def _count_cache_key_timesteps(self, cache_key):
+        """Query Table 3 for how many rows have a particular `cache_key`.
+
+        TODO: ROY: Finish this docstring
+
+        Returns:
+            int: The number of timestep rows associated with the given `cache_key`.
+        """
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        cur.execute(
+            f"select count(*) from {valid_embedding_table_name} where cache_key = ?",
+            (cache_key,),
+        )
+
+        ((count,),) = cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        return count
 
     def validate(self):
         """Validate the KNNStoreSQLite instance.
