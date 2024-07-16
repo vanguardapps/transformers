@@ -25,7 +25,7 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, is_dataclass
 from datasets import Value
-from itertools import islice
+from itertools import chain, islice
 from torch.utils.data import DataLoader
 from transformers import (
     AutoConfig,
@@ -1892,6 +1892,10 @@ class KNNStore(ABC):
         default_embedding_batch_size (int): (class attribute)
         default_target_batch_size (int): (class attribute)
         default_c (int): (class attribute)
+        default_ivf_pq_ratio (int): (class attribute)
+        default_source_use_ivf_pq (bool): (class attribute)
+        default_target_use_ivf_pq (bool): (class attribute)
+
         table_prefix (str):
         configuration_table_stem (str):
         embedding_table_stem (str):
@@ -1904,6 +1908,17 @@ class KNNStore(ABC):
         embedding_batch_size (int):
         target_batch_size (int):
         c (int):
+        source_use_ivf_pq (bool):
+        source_ncentroids (int):
+        source_msubspaces (int):
+        source_nbits (int):
+        source_nprobe (int):
+        target_use_ivf_pq (bool):
+        target_ncentroids (int):
+        target_msubspaces (int):
+        target_nbits (int):
+        target_nprobe (int):
+        ivf_pq_ratio (int):
     """
 
     default_table_prefix = "knn_store"
@@ -1914,6 +1929,11 @@ class KNNStore(ABC):
     default_target_batch_size = 50
     default_embedding_dtype = "float32"
     default_c = 5
+    default_source_use_ivf_pq = False
+    default_target_use_ivf_pq = False
+
+    # see comment by mdouze (faiss maintainer) at https://github.com/facebookresearch/faiss/issues/2089
+    default_ivf_pq_ratio = 50
 
     # allowed HF parameters to `AutoTokenizer.from_pretrained()`
     HF_TOKENIZER_PARAMS = [
@@ -1960,6 +1980,17 @@ class KNNStore(ABC):
         target_batch_size=None,
         embedding_dtype=None,
         c=None,
+        source_use_ivf_pq=None,
+        source_ncentroids=None,
+        source_msubspaces=None,
+        source_nbits=None,
+        source_nprobe=None,
+        target_use_ivf_pq=None,
+        target_ncentroids=None,
+        target_msubspaces=None,
+        target_nbits=None,
+        target_nprobe=None,
+        ivf_pq_ratio=None,
         **kwargs,
     ):
         """Initializes KNNStore instance.
@@ -1977,6 +2008,17 @@ class KNNStore(ABC):
             target_batch_size (int):
             embedding_dtype (str):
             c (int):
+            source_use_ivf_pq (bool):
+            source_ncentroids (int):
+            source_msubspaces (int):
+            source_nbits (int):
+            source_nprobe (int):
+            target_use_ivf_pq (bool):
+            target_ncentroids (int):
+            target_msubspaces (int):
+            target_nbits (int):
+            target_nprobe (int):
+            ivf_pq_ratio (int):
             **kwargs (dict):
 
         """
@@ -2029,6 +2071,27 @@ class KNNStore(ABC):
         )
 
         self.c = c if c is not None else KNNStore.default_c
+        self.source_use_ivf_pq = (
+            source_use_ivf_pq
+            if source_use_ivf_pq is not None
+            else KNNStore.default_source_use_ivf_pq
+        )
+        self.source_ncentroids = source_ncentroids
+        self.source_msubspaces = source_msubspaces
+        self.source_nbits = source_nbits
+        self.source_nprobe = source_nprobe
+        self.target_ncentroids = target_ncentroids
+        self.target_msubspaces = target_msubspaces
+        self.target_nbits = target_nbits
+        self.target_nprobe = target_nprobe
+        self.target_use_ivf_pq = (
+            target_use_ivf_pq
+            if target_use_ivf_pq is not None
+            else KNNStore.default_target_use_ivf_pq
+        )
+        self.ivf_pq_ratio = (
+            ivf_pq_ratio if ivf_pq_ratio is not None else KNNStore.default_ivf_pq_ratio
+        )
 
         self.configuration_table_name = (
             self.table_prefix + "_" + self.configuration_table_stem
@@ -2117,6 +2180,59 @@ class KNNStore(ABC):
                 "resumed at a later time after stopping."
             )
 
+    def _source_using_ivf_pq(self):
+        return self.source_use_ivf_pq or (
+            self.source_ncentroids is not None
+            or self.source_msubspaces is not None
+            or self.source_nbits is not None
+            or self.source_nprobe is not None
+        )
+
+    def _target_using_ivf_pq(self):
+        return self.target_use_ivf_pq or (
+            self.target_ncentroids is not None
+            or self.target_msubspaces is not None
+            or self.target_nbits is not None
+            or self.target_nprobe is not None
+        )
+
+    @staticmethod
+    def _is_ivf_pq_feasible(vector_count, ivf_pq_ratio):
+        train_count_for_2bits = 4 * ivf_pq_ratio
+        if vector_count < train_count_for_2bits:
+            return False
+        return True
+
+    @staticmethod
+    def _get_ivf_pq_config(
+        vector_count, embedding_dim, ivf_pq_ratio, ncentroids, msubspaces, nbits, nprobe
+    ):
+        # minimum count of training data by nbits
+        train_count_for_nbits = {
+            2: 4 * ivf_pq_ratio,
+            4: 16 * ivf_pq_ratio,
+            8: 256 * ivf_pq_ratio,
+        }
+
+        if vector_count < train_count_for_nbits[2]:
+            raise ValueError(
+                f"Vector count of {vector_count} is not suitable for index of type `IndexIVFPQ`, as "
+                "there is not enough data to train the minimum of 4 centroids (2-bit codebook), "
+                f"which requires {train_count_2bit} training examples at minimum."
+            )
+
+        ncentroids = ncentroids if ncentroids is not None else 4
+        msubspaces = msubspaces if msubspaces is not None else embedding_dim / 2
+        nbits = (
+            2
+            if vector_count < train_count_for_nbits[4]
+            else 4 if vector_count < train_count_for_nbits[8] else 8
+        )
+        nprobe = nprobe if nprobe is not None else 1
+        train_count = train_count_for_nbits[nbits]
+
+        return (ncentroids, msubspaces, nbits, nprobe, train_count)
+
     def _ingest_batch(self, batch, cache_key):
         """TODO: ROY: finish docstring
 
@@ -2191,16 +2307,7 @@ class KNNStore(ABC):
         )
 
         timestep_count = self._count_cache_key_timesteps(cache_key=fingerprint)
-
-        if timestep_count > 0:
-            print(f"Resuming from timestep_count {timestep_count}.")
-        else:
-            print("Starting ingest on new dataset.")
-
         dataset = dataset.select([i for i in range(timestep_count, len(dataset))])
-
-        print(f"{len(dataset)} rows remaining to be processed in dataset.")
-        print(f"Using batches of {batch_size}.")
 
         loader = DataLoader(
             dataset=dataset,
@@ -2210,6 +2317,10 @@ class KNNStore(ABC):
 
         if progress_bar:
             loader = tqdm(loader)
+            loader.set_description(
+                f"Ingesting {len(dataset)} rows using batch size {batch_size}.\n"
+                f"Resuming from timestep {timestep_count}."
+            )
 
         for batch in loader:
             text_source = batch[src_col]
@@ -2220,8 +2331,61 @@ class KNNStore(ABC):
         # TODO: ROY: Capture process / keyboard interrupt and return this no matter what
         return fingerprint
 
-    def _get_new_faiss_index(self):
-        return faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dim))
+    def _get_new_source_index(self, vector_count):
+        quantizer = faiss.IndexFlatL2(self.embedding_dim)
+        if self._source_using_ivf_pq() and KNNStore._is_ivf_pq_feasible(
+            vector_count, self.ivf_pq_ratio
+        ):
+            # acquire the configuration of faiss.IndexIVFPQ from central helper
+            ncentroids, msubspaces, nbits, nprobe, train_count = (
+                KNNStore._get_ivf_pq_config(
+                    vector_count=vector_count,
+                    embedding_dim=self.embedding_dim,
+                    ivf_pq_ratio=self.ivf_pq_ratio,
+                    ncentroids=self.source_ncentroids,
+                    msubspaces=self.source_msubspaces,
+                    nbits=self.source_nbits,
+                    nprobe=self.source_nprobe,
+                )
+            )
+
+            index_ivf_pq = faiss.IndexIVFPQ(
+                quantizer, self.embedding_dim, ncentroids, msubspaces, nbits
+            )
+
+            index_ivf_pq.nprobe = nprobe
+
+            train_data = None
+            index_ivf_pq.train(train_data)
+        return faiss.IndexIDMap(quantizer)
+
+    def _get_new_target_index(self, vector_count):
+        quantizer = faiss.IndexFlatL2(self.embedding_dim)
+        if self._target_using_ivf_pq() and KNNStore._is_ivf_pq_feasible(
+            vector_count, self.ivf_pq_ratio
+        ):
+            # acquire the configuration of faiss.IndexIVFPQ from central helper
+            ncentroids, msubspaces, nbits, nprobe, train_count = (
+                KNNStore._get_ivf_pq_config(
+                    vector_count=vector_count,
+                    embedding_dim=self.embedding_dim,
+                    ivf_pq_ratio=self.ivf_pq_ratio,
+                    ncentroids=self.target_ncentroids,
+                    msubspaces=self.target_msubspaces,
+                    nbits=self.target_nbits,
+                    nprobe=self.target_nprobe,
+                )
+            )
+
+            index_ivf_pq = faiss.IndexIVFPQ(
+                quantizer, self.embedding_dim, ncentroids, msubspaces, nbits
+            )
+
+            index_ivf_pq.nprobe = nprobe
+
+            train_data = None
+            index_ivf_pq.train(train_data)
+        return faiss.IndexIDMap(quantizer)
 
     def _get_embedding_dtype(self):
         # TODO: add support for dtypes other than np.float32
@@ -2296,16 +2460,16 @@ class KNNStore(ABC):
 
         if progress_bar:
             source_token_ids = tqdm(source_token_ids)
+            source_token_ids.set_description("Building source token index")
 
         for source_token_id in source_token_ids:
+            vector_count = self._retrieve_source_embedding_count(source_token_id)
+
+            faiss_index = self._get_new_source_index(vector_count)
+
             embedding_batches = self._retrieve_source_token_embeddings_batches(
                 source_token_id
             )
-
-            faiss_index = self.get_source_token_faiss_index(source_token_id)
-
-            if faiss_index is None:
-                faiss_index = self._get_new_faiss_index()
 
             ids_added = []
 
@@ -2317,7 +2481,9 @@ class KNNStore(ABC):
                 ids_added += batch_ids
 
             bytestring = KNNStore._convert_faiss_index_to_bytestring(faiss_index)
-            self._store_source_faiss_bytestring(source_token_id, bytestring, ids_added)
+            self._overwrite_source_faiss_bytestring(
+                source_token_id, bytestring, ids_added
+            )
             faiss_index.reset()
 
     def get_source_token_faiss_index(self, source_token_id):
@@ -2331,22 +2497,29 @@ class KNNStore(ABC):
         encoder_input_ids,
         encoder_last_hidden_state,
         c=None,
+        progress_bar=None,
     ):
         """Builds one target datastore faiss index for each sequence in the batch
         TODO: ROY: Finish this docstring
         """
 
         c = c if c is not None else self.c
+        progress_bar = progress_bar if progress_bar is not None else False
 
         batch_size = encoder_input_ids.shape[0]
         self.target_datastore = [None] * batch_size
+        sequences = range(batch_size)
 
-        for index in (batches := tqdm(range(batch_size))):
-            batches.set_description(f"Building target datastore batch {index}")
+        if progress_bar:
+            sequences = tqdm(sequences)
+            sequences.set_description("Building target datastore")
 
+        using_ivf_pq = self._target_using_ivf_pq()
+
+        for index in sequences:
             queries = {}
 
-            # Gather faiss indices for each source_token_id in the sequence along with the queries for each
+            # gather faiss indices for each source_token_id in the sequence along with the queries for each
             for source_token_id, source_embedding in zip(
                 encoder_input_ids[index], encoder_last_hidden_state[index]
             ):
@@ -2371,26 +2544,57 @@ class KNNStore(ABC):
 
             if len(unique_source_token_ids) > 0:
                 self.target_datastore[index] = KNNStore.__FaissQueries__(
-                    faiss_index=self._get_new_faiss_index(),
                     embedding_dim=self.embedding_dim,
                     embedding_dtype=self._get_embedding_dtype(),
                 )
 
-            # Run bulk queries against faiss indices for each source token
+            # run bulk queries against faiss indices for each source token
+            result_ids_by_source_token = {}
             for source_token_id in unique_source_token_ids:
-                # TODO: ROY: Parameterize based on preferences / environment the `use_gpu` flag
                 if isinstance(queries[source_token_id], KNNStore.__FaissQueries__):
-                    _, embedding_ids = queries[source_token_id].run(use_gpu=True)
-                    unique_embedding_ids = np.unique(embedding_ids.flatten())
-                    rows = self._retrieve_target_bytestrings(
-                        unique_embedding_ids[unique_embedding_ids > 0].tolist()
-                    )
-                    batch_ids, batch_bytestrings = zip(*rows)
-                    self._add_bytestrings_to_faiss_index(
-                        self.target_datastore[index].faiss_index,
-                        batch_ids,
-                        batch_bytestrings,
-                    )
+                    _, result_ids = queries[source_token_id].run()
+                    unique_result_ids = np.unique(result_ids.flatten())
+                    unique_result_ids = unique_result_ids[
+                        unique_result_ids > 0
+                    ].tolist()
+                    result_ids_by_source_token[source_token_id] = unique_result_ids
+
+            # compute total number of vectors in the datastore for this sequence (used to build IVFPQ index)
+            vector_count = (
+                sum(
+                    [
+                        len(result_ids)
+                        for _, result_ids in result_ids_by_source_token.items()
+                    ]
+                )
+                if using_ivf_pq
+                else None
+            )
+
+            # get sample for training k-means estimators if using IVFPQ index
+            all_result_ids = list(
+                chain.from_iterable(
+                    [ids for _, ids in result_ids_by_source_token.items()]
+                )
+            )
+            train_dataset = self._get_k_means_target_train_dataset(
+                vector_count, all_result_ids
+            )
+
+            # build one faiss index per sequence, passing expected vector count
+            self.target_datastore[index].faiss_index = self._get_new_target_index(
+                vector_count, train_dataset
+            )
+
+            # add all qualifying target-side embeddings to the target datastore for the sequence
+            for source_token_id, result_ids in result_ids_by_source_token.items():
+                rows = self._retrieve_target_bytestrings(result_ids)
+                batch_ids, batch_bytestrings = zip(*rows)
+                self._add_bytestrings_to_faiss_index(
+                    self.target_datastore[index].faiss_index,
+                    batch_ids,
+                    batch_bytestrings,
+                )
 
     def search_target_datastore(
         self,
@@ -2478,7 +2682,7 @@ class KNNStore(ABC):
                 )
 
         # shape (batch_size, k)
-        exp_term = np.exp(-batch_l2_distances / temperature)
+        exp_term = np.exp(-np.sqrt(batch_l2_distances) / temperature)
 
         # replace any infinitesimal or zero values in `exp_term` with epsilon
         epsilon = 1e-7
@@ -2657,15 +2861,28 @@ class KNNStore(ABC):
         )
 
     @abstractmethod
+    def _retrieve_source_embedding_count(self, source_token_id):
+        """Returns the count of embeddings with a given source token ID. This is an abstract method.
+
+        Args:
+            source_token_id (int):
+
+        Returns:
+            int: Count of rows from Table 2 matching the condition.
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_retrieve_source_embedding_count` in a subclass."
+        )
+
+    @abstractmethod
     def _retrieve_source_token_embeddings_batches(self, source_token_id):
-        """Retrieves one batch of source token embeddings from the DB. This is an abstract method.
+        """Returns a generator of batches of source embeddings. This is an abstract method.
 
-        GENERATOR FUNCTION.
-
-        Yields a single batch of `source_embedding` fields from Table 2. Retrieves one batch
-        according to self._embedding_table_offset and self.embedding_batch_size. Usually this
-        will be implemented using something akin to `offset` and `limit` in the DB, and utizing
-        an `order by` clause to ensure the offset and limit remain meaningful between function calls.
+        GENERATOR FUNCTION:
+            Yields a single batch of `source_embedding` fields from Table 2. Retrieves one batch
+            according to self._embedding_table_offset and self.embedding_batch_size. Usually this
+            will be implemented using something akin to `offset` and `limit` in the DB, and utizing
+            an `order by` clause to ensure the offset and limit remain meaningful between function calls.
 
         Note: Must call `self._increment_source_token_embeddings_offset()` before yielding each batch.
 
@@ -2687,7 +2904,9 @@ class KNNStore(ABC):
         )
 
     @abstractmethod
-    def _store_source_faiss_bytestring(self, source_token_id, bytestring, ids_added):
+    def _overwrite_source_faiss_bytestring(
+        self, source_token_id, bytestring, ids_added
+    ):
         """Stores faiss index for source embeddings across one source token ID. This is an abstract method.
 
         Stores the faiss index represented in the `bytestring` parameter in Table 3, overwriting any
@@ -2706,7 +2925,7 @@ class KNNStore(ABC):
                 Table 2 IDs (timesteps) that are being added as part of persisting this bytestring.
         """
         raise NotImplementedError(
-            "Make sure to implement `_store_source_faiss_bytestring` in a subclass."
+            "Make sure to implement `_overwrite_source_faiss_bytestring` in a subclass."
         )
 
     @abstractmethod
@@ -2734,7 +2953,7 @@ class KNNStore(ABC):
 
     @abstractmethod
     def _retrieve_target_bytestrings(self, embedding_ids):
-        """Retrieves target token embeddings corresponding to a list of Table 2 IDs.
+        """Retrieves target token embeddings corresponding to a list of Table 2 IDs. This is an abstract method.
 
         Retrieves all target token embeddings according to a list of Table 2 IDs (`embedding_ids`).
         The format of the return should be a tuple of rows where each row is a two-element tuple:
@@ -2760,7 +2979,7 @@ class KNNStore(ABC):
 
     @abstractmethod
     def _retrieve_target_token_ids(self, embedding_ids):
-        """Retrieves target token IDs to a list of Table 2 IDs.
+        """Retrieves target token IDs to a list of Table 2 IDs. This is an abstract method.
 
         Retrieves all target token IDs according to a list of Table 2 IDs (`embedding_ids`).
         The format of the return should be a tuple of integer target token IDs:
@@ -2785,7 +3004,7 @@ class KNNStore(ABC):
 
     @abstractmethod
     def _truncate_artifacts(self, cache_key):
-        """Removes artifacts according to their `cache_key`.
+        """Removes artifacts according to their `cache_key`. This is an abstract method.
 
         TODO: ROY: Finish this docstring
 
@@ -2801,7 +3020,7 @@ class KNNStore(ABC):
 
     @abstractmethod
     def _truncate_all_artifacts(self):
-        """Removes all artifacts, leaving only core configurations.
+        """Removes all artifacts, leaving only core configurations. This is an abstract method.
 
         TODO: ROY: Finish this docstring
 
@@ -2823,6 +3042,15 @@ class KNNStore(ABC):
         """
         raise NotImplementedError(
             "Make sure to implement `_count_cache_key_timesteps` in a subclass."
+        )
+
+    @abstractmethod
+    def _get_target_train_dataset(self, vector_count):
+        """Query Table 2
+        TODO: ROY: Finish this
+        """
+        raise NotImplementedError(
+            "Make sure to implement `_get_target_train_dataset` in a subclass."
         )
 
     class __FaissQueries__(dict):
@@ -2851,7 +3079,7 @@ class KNNStore(ABC):
             """Initialize a faiss index queries container.
 
             Args:
-                faiss_index (faiss.swigfaiss_avx2.IndexIDMap):
+                faiss_index (faiss.swigfaiss_avx2.IndexIDMap or faiss.swigfaiss_avx2.IndexIVFPQ):
                     The fully initialized FAISS index with vectors preloaded. Note: only CPU-stored faiss
                     indices should be passed, as the index will be moved to the GPU at query time and then
                     removed after.
@@ -2863,13 +3091,10 @@ class KNNStore(ABC):
                     The number of nearest neighbors to return data for when running queries against
                     the stored `faiss_index`. Defaults to 3.
             """
-            if faiss_index is None:
-                raise ValueError("Missing required parameter `faiss_index`.")
+            self.faiss_index = faiss_index
 
             if embedding_dim is None:
                 raise ValueError("Missing required parameter `embedding_dim`.")
-
-            self.faiss_index = faiss_index
 
             self.embedding_dim = embedding_dim
             self.embedding_dtype = (
@@ -2879,6 +3104,25 @@ class KNNStore(ABC):
             self.k = k if k is not None else 3
 
             self.queries = np.empty((0, self.embedding_dim), dtype=self.embedding_dtype)
+
+        def _validate_faiss_index(self, faiss_index):
+            if not isinstance(
+                faiss_index,
+                (faiss.swigfaiss_avx2.IndexIDMap, faiss.swigfaiss_avx2.IndexIVFPQ),
+            ):
+                raise ValueError(
+                    "Parameter `faiss_index` must be either of type "
+                    "'faiss.swigfaiss_avx2.IndexIDMap' or 'faiss.swigfaiss_avx2.IndexIVFPQ'."
+                )
+
+        @property
+        def faiss_index(self):
+            return self._faiss_index
+
+        @faiss_index.setter
+        def faiss_index(self, faiss_index):
+            self._validate_faiss_index(faiss_index)
+            self._faiss_index = faiss_index
 
         def add_query(self, query_embedding):
             """Add one embedding to the list of query embeddings for this faiss index.
@@ -2908,7 +3152,7 @@ class KNNStore(ABC):
             """Clear all queries from the FaissQueries instance."""
             self.queries = np.empty((0, self.embedding_dim), dtype=self.embedding_dtype)
 
-        def run(self, k=None, use_gpu=None):
+        def run(self, k=None):
             """Run all queries currently stored in the container.
 
             Runs all queries stored in `queries` against `faiss_index`.
@@ -2918,10 +3162,6 @@ class KNNStore(ABC):
                     The number of nearest neighbors for which to return data when running queries against
                     the stored `faiss_index`. Defaults to `self.k` on the object, which defaults to 3
                     when not specified at construction time.
-                use_gpu (bool):
-                    Whether to place the index on the GPU prior to searching. This also implies that the
-                    index is automatically deallocated (by calling `faiss_index.reset()`) after the search
-                    is complete.
 
             Returns:
                 tuple(ndarray, ndarray):
@@ -2930,28 +3170,7 @@ class KNNStore(ABC):
                     matrix of IDs for the neighbor at that column for the query at that row.
             """
             k = k if k is not None else self.k
-
-            # TODO: ROY: `faiss-gpu` package is unreliable for newer CUDA versions. Need to use the
-            # wheel, but that means figuring out a place to store the wheel and how to integrate it
-            # into the Hugging Face setup script. For now, run faiss on CPU and complete testing
-            # and debugging, face this problem last:
-            # use_gpu = use_gpu if use_gpu is not None else False
-            use_gpu = False
-
-            if use_gpu:
-                # TODO: ROY: Expand this to support multiple GPUs / GPU array
-                # Should be something like the following:
-                # gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
-                res = faiss.StandardGpuResources()
-                faiss_index = faiss.index_cpu_to_gpu(res, 0, self.faiss_index)
-            else:
-                faiss_index = self.faiss_index
-
-            distance, ids = faiss_index.search(self.queries, k)
-
-            if use_gpu:
-                faiss_index.reset()
-
+            distance, ids = self._faiss_index.search(self.queries, k)
             return distance, ids
 
 
@@ -3223,6 +3442,26 @@ class KNNStoreSQLite(KNNStore):
 
         return source_token_ids
 
+    def _retrieve_source_embedding_count(self, source_token_id):
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        cur.execute(
+            f"select count(*) from {valid_embedding_table_name} where source_token_id = ?",
+            (int(source_token_id),),
+        )
+
+        ((count,),) = cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        return count
+
     def _retrieve_source_token_embeddings_batches(self, source_token_id):
         valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
@@ -3265,7 +3504,9 @@ class KNNStoreSQLite(KNNStore):
         cur.close()
         con.close()
 
-    def _store_source_faiss_bytestring(self, source_token_id, bytestring, ids_added):
+    def _overwrite_source_faiss_bytestring(
+        self, source_token_id, bytestring, ids_added
+    ):
         valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
