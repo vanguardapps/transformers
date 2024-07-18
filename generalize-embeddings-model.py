@@ -29,7 +29,7 @@ def main():
     #     progress_bar=True,
     # )
 
-    knn_store.build_source_index(progress_bar=True)
+    # knn_store.build_source_index(progress_bar=True)
 
     # # AFTER doing all of the above work, the below should "just work"
     # model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint)

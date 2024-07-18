@@ -2118,6 +2118,19 @@ class KNNStore(ABC):
         serialized_index = faiss.serialize_index(faiss_index)
         return serialized_index.tobytes()
 
+    @staticmethod
+    def _convert_bytestrings_to_numpy(batch_bytestrings, embedding_dtype):
+        return np.array(
+            [
+                np.frombuffer(embedding, dtype=embedding_dtype)
+                for embedding in batch_bytestrings
+            ]
+        )
+
+    @staticmethod
+    def _convert_ids_to_numpy(batch_ids):
+        return np.array(batch_ids, dtype=np.int64)
+
     #
     # Methods provided as part of base class
     #
@@ -2330,11 +2343,49 @@ class KNNStore(ABC):
 
         # TODO: ROY: Capture process / keyboard interrupt and return this no matter what
         return fingerprint
+    
+    def _get_k_means_train_dataset(
+        self, train_count, embedding_ids, return_target_embeddings=None
+    ):
+        """Query Table 1 for training examples according to `train_count` and `embedding_ids`.
 
-    def _get_new_source_index(self, vector_count):
+        Will return source-side embeddings by default, unless `return_target_embeddings=True`.
+
+        TODO: ROY: Finish this docstring
+
+        Given:
+            e = embedding dimension (self.embedding_dim)
+            n = passed `train_count`
+
+        Returns:
+            ndarray(n, e): numpy.float32 array of n training examples of dimension e.
+        """
+        return_target_embeddings = (
+            return_target_embeddings if return_target_embeddings is not None else False
+        )
+
+        embedding_ids_np = KNNStore._convert_ids_to_numpy(embedding_ids)
+        train_ids = np.random.choice(embedding_ids_np, train_count, replace=False)
+
+        rows = (
+            self._retrieve_target_bytestrings(train_ids)
+            if return_target_embeddings
+            else self._retrieve_source_bytestrings(train_ids)
+        )
+
+        bytestrings = list(zip(*rows))[1] if len(rows) > 0 else ()
+        embeddings = KNNStore._convert_bytestrings_to_numpy(
+            bytestrings, embedding_dtype=self._get_embedding_dtype()
+        )
+
+        return embeddings
+
+    def _get_new_source_index(self, index_ids=None):
         quantizer = faiss.IndexFlatL2(self.embedding_dim)
-        if self._source_using_ivf_pq() and KNNStore._is_ivf_pq_feasible(
-            vector_count, self.ivf_pq_ratio
+        vector_count = len(index_ids) if index_ids is not None else None
+
+        if vector_count is not None and self._source_using_ivf_pq() and KNNStore._is_ivf_pq_feasible(
+            vector_count=vector_count, ivf_pq_ratio=self.ivf_pq_ratio
         ):
             # acquire the configuration of faiss.IndexIVFPQ from central helper
             ncentroids, msubspaces, nbits, nprobe, train_count = (
@@ -2349,20 +2400,32 @@ class KNNStore(ABC):
                 )
             )
 
+            train_dataset = self._get_k_means_train_dataset(
+                train_count, index_ids, return_target_embeddings=False
+            )
+
+            if not isinstance(train_dataset, np.ndarray):
+                raise ValueError(
+                    "Please ensure you are returning a numpy array from your implementation of `KNNStore`. "
+                    "`KNNStore._get_k_means_train_dataset` must return an array of type `numpy.ndarray`."
+                )
+
             index_ivf_pq = faiss.IndexIVFPQ(
                 quantizer, self.embedding_dim, ncentroids, msubspaces, nbits
             )
-
             index_ivf_pq.nprobe = nprobe
+            index_ivf_pq.train(train_dataset)
 
-            train_data = None
-            index_ivf_pq.train(train_data)
+            return index_ivf_pq
+
         return faiss.IndexIDMap(quantizer)
 
-    def _get_new_target_index(self, vector_count):
+    def _get_new_target_index(self, index_ids=None):
         quantizer = faiss.IndexFlatL2(self.embedding_dim)
-        if self._target_using_ivf_pq() and KNNStore._is_ivf_pq_feasible(
-            vector_count, self.ivf_pq_ratio
+        vector_count = len(index_ids) if index_ids is not None else None
+
+        if vector_count is not None and self._target_using_ivf_pq() and KNNStore._is_ivf_pq_feasible(
+            vector_count=vector_count, ivf_pq_ratio=self.ivf_pq_ratio
         ):
             # acquire the configuration of faiss.IndexIVFPQ from central helper
             ncentroids, msubspaces, nbits, nprobe, train_count = (
@@ -2377,14 +2440,24 @@ class KNNStore(ABC):
                 )
             )
 
+            train_dataset = self._get_k_means_train_dataset(
+                train_count, index_ids, return_target_embeddings=True
+            )
+
+            if not isinstance(train_dataset, np.ndarray):
+                raise ValueError(
+                    "Please ensure you are returning a numpy array from your implementation of `KNNStore`. "
+                    "`KNNStore._get_k_means_train_dataset` must return an array of type `numpy.ndarray`."
+                )
+
             index_ivf_pq = faiss.IndexIVFPQ(
                 quantizer, self.embedding_dim, ncentroids, msubspaces, nbits
             )
-
             index_ivf_pq.nprobe = nprobe
+            index_ivf_pq.train(train_dataset)
 
-            train_data = None
-            index_ivf_pq.train(train_data)
+            return index_ivf_pq
+
         return faiss.IndexIDMap(quantizer)
 
     def _get_embedding_dtype(self):
@@ -2443,13 +2516,10 @@ class KNNStore(ABC):
     def _add_bytestrings_to_faiss_index(
         self, faiss_index, batch_ids, batch_bytestrings
     ):
-        batch_embeddings_np = np.array(
-            [
-                np.frombuffer(embedding, dtype=self._get_embedding_dtype())
-                for embedding in batch_bytestrings
-            ]
+        batch_embeddings_np = KNNStore._convert_bytestrings_to_numpy(
+            batch_bytestrings, self._get_embedding_dtype()
         )
-        batch_ids_np = np.array(batch_ids, dtype=np.int64)
+        batch_ids_np = KNNStore._convert_ids_to_numpy(batch_ids)
         faiss.normalize_L2(batch_embeddings_np)
         faiss_index.add_with_ids(batch_embeddings_np, batch_ids_np)
 
@@ -2462,10 +2532,12 @@ class KNNStore(ABC):
             source_token_ids = tqdm(source_token_ids)
             source_token_ids.set_description("Building source token index")
 
-        for source_token_id in source_token_ids:
-            vector_count = self._retrieve_source_embedding_count(source_token_id)
+        source_using_ivf_pq = self._source_using_ivf_pq()
 
-            faiss_index = self._get_new_source_index(vector_count)
+        for source_token_id in source_token_ids:
+            index_ids = self._retrieve_source_embedding_ids(source_token_id) if source_using_ivf_pq else None
+
+            faiss_index = self._get_new_source_index(index_ids)
 
             embedding_batches = self._retrieve_source_token_embeddings_batches(
                 source_token_id
@@ -2514,7 +2586,7 @@ class KNNStore(ABC):
             sequences = tqdm(sequences)
             sequences.set_description("Building target datastore")
 
-        using_ivf_pq = self._target_using_ivf_pq()
+        target_using_ivf_pq = self._target_using_ivf_pq()
 
         for index in sequences:
             queries = {}
@@ -2559,32 +2631,15 @@ class KNNStore(ABC):
                     ].tolist()
                     result_ids_by_source_token[source_token_id] = unique_result_ids
 
-            # compute total number of vectors in the datastore for this sequence (used to build IVFPQ index)
-            vector_count = (
-                sum(
-                    [
-                        len(result_ids)
-                        for _, result_ids in result_ids_by_source_token.items()
-                    ]
-                )
-                if using_ivf_pq
-                else None
-            )
-
-            # get sample for training k-means estimators if using IVFPQ index
-            all_result_ids = list(
+            # get all timestep IDs in the datastore for this sequence (for training IVFPQ k-means)
+            index_ids = list(
                 chain.from_iterable(
                     [ids for _, ids in result_ids_by_source_token.items()]
                 )
-            )
-            train_dataset = self._get_k_means_target_train_dataset(
-                vector_count, all_result_ids
-            )
+            ) if target_using_ivf_pq else None
 
             # build one faiss index per sequence, passing expected vector count
-            self.target_datastore[index].faiss_index = self._get_new_target_index(
-                vector_count, train_dataset
-            )
+            self.target_datastore[index].faiss_index = self._get_new_target_index(index_ids)
 
             # add all qualifying target-side embeddings to the target datastore for the sequence
             for source_token_id, result_ids in result_ids_by_source_token.items():
@@ -2861,17 +2916,17 @@ class KNNStore(ABC):
         )
 
     @abstractmethod
-    def _retrieve_source_embedding_count(self, source_token_id):
-        """Returns the count of embeddings with a given source token ID. This is an abstract method.
+    def _retrieve_source_embedding_ids(self, source_token_id):
+        """Returns a tuple of timestep IDs corresponding to the passed `source_token_id`.
 
         Args:
             source_token_id (int):
 
         Returns:
-            int: Count of rows from Table 2 matching the condition.
+            tuple(int): Tuple of integer timestep IDs
         """
         raise NotImplementedError(
-            "Make sure to implement `_retrieve_source_embedding_count` in a subclass."
+            "Make sure to implement `_retrieve_source_embedding_ids` in a subclass."
         )
 
     @abstractmethod
@@ -3042,15 +3097,6 @@ class KNNStore(ABC):
         """
         raise NotImplementedError(
             "Make sure to implement `_count_cache_key_timesteps` in a subclass."
-        )
-
-    @abstractmethod
-    def _get_target_train_dataset(self, vector_count):
-        """Query Table 2
-        TODO: ROY: Finish this
-        """
-        raise NotImplementedError(
-            "Make sure to implement `_get_target_train_dataset` in a subclass."
         )
 
     class __FaissQueries__(dict):
@@ -3435,14 +3481,13 @@ class KNNStoreSQLite(KNNStore):
         )
 
         rows = cur.fetchall()
-        source_token_ids = tuple(row[0] for row in rows)
 
         cur.close()
         con.close()
 
-        return source_token_ids
+        return tuple(zip(*rows))[0] if len(rows) > 0 else ()
 
-    def _retrieve_source_embedding_count(self, source_token_id):
+    def _retrieve_source_embedding_ids(self, source_token_id):
         valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
             self.embedding_table_name
         )
@@ -3451,16 +3496,16 @@ class KNNStoreSQLite(KNNStore):
         cur = con.cursor()
 
         cur.execute(
-            f"select count(*) from {valid_embedding_table_name} where source_token_id = ?",
+            f"select id from {valid_embedding_table_name} where source_token_id = ?",
             (int(source_token_id),),
         )
 
-        ((count,),) = cur.fetchall()
+        rows = cur.fetchall()
 
         cur.close()
         con.close()
 
-        return count
+        return tuple(zip(*rows))[0] if len(rows) > 0 else ()
 
     def _retrieve_source_token_embeddings_batches(self, source_token_id):
         valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
@@ -3567,6 +3612,30 @@ class KNNStoreSQLite(KNNStore):
         bytestring = result[0][0]
 
         return bytestring
+
+    def _retrieve_source_bytestrings(self, embedding_ids):
+        valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
+            self.embedding_table_name
+        )
+
+        con = self._get_sqlite_connection()
+        cur = con.cursor()
+
+        # process in batches of 1000 due to SQLite limit of 32766 placeholders in one statement
+        # see "9. Maximum Number of Host Parameters In A Single SQL Statement": https://www.sqlite.org/limits.html
+        rows = []
+        for batch_ids in batched(embedding_ids, 1000):
+            placeholders = len(batch_ids) * "?"
+            cur.execute(
+                f"select ids, source_embedding from {valid_embedding_table_name} where id in ({','.join(placeholders)});",
+                batch_ids,
+            )
+            rows += cur.fetchall()
+
+        cur.close()
+        con.close()
+
+        return rows
 
     def _retrieve_target_bytestrings(self, embedding_ids):
         valid_embedding_table_name = KNNStoreSQLite._validate_table_name(
